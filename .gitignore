@@ -1,0 +1,21 @@
+# Ignore environment variables
+config/.env
+
+# Ignore Python cache and virtual environment
+__pycache__/
+venv/
+
+# Ignore IDE-specific files
+.vscode/
+.idea/
+
+# Ignore local test data
+tests/local_*.sql
+
+# Ignore macOS system files
+.DS_Store
+
+# Ignore large/local meme assets
+*.jpg
+*.png
+!docs/*.png  # Except images in /docs
