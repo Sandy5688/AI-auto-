@@ -19,3 +19,5 @@ tests/local_*.sql
 *.jpg
 *.png
 !docs/*.png  # Except images in /docs
+.env
+src/sol1.py
