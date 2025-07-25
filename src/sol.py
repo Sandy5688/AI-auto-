@@ -1,73 +1,84 @@
+import os
+import logging
+import traceback
+from datetime import datetime
+from supabase import create_client
+from dotenv import load_dotenv
 import schedule
 import time
-from datetime import datetime, timezone
-from supabase import create_client
-import random
 
-# Supabase setup (replace with your credentials)
-SUPABASE_URL = "https://hlphvrulcwlahwifmeur.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhscGh2cnVsY3dsYWh3aWZtZXVyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTE5OTM1NzQsImV4cCI6MjA2NzU2OTU3NH0._hPUFuM8OlKUSP2R093ZeNFr8WIpI2aJkygMeOkAb6A"
+# Load environment variables
+load_dotenv("config/.env")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+# Configure logger
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# Supabase client
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Log job results to Supabase
 def log_job(job_name, status, payload=None, error_message=None):
-    # Format timestamp to ISO 8601 without microseconds and remove 'Z'
-    timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-    log_data = {
+    entry = {
         "job_name": job_name,
         "status": status,
-        "timestamp": timestamp,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
         "payload": payload or {},
-        "error_message": error_message or ""
+        "error_message": error_message
     }
-    supabase.table("job_logs").insert(log_data).execute()
-
-# Daily score refresh (placeholder)
-def daily_score_refresh():
     try:
-        # Placeholder: Update scores in Supabase
-        # Example: Reset scores or recalculate based on recent data
-        payload = {"users_updated": random.randint(50, 100)}  # Mock data
-        log_job("daily_score_refresh", "success", payload)
-        print("Daily score refresh completed")
+        supabase.table("job_logs").insert(entry).execute()
+        logger.info(f"Job log written for {job_name}, status: {status}")
     except Exception as e:
-        log_job("daily_score_refresh", "failure", error_message=str(e))
-        print(f"Daily score refresh failed: {e}")
+        logger.error(f"Could not log job {job_name}: {e}")
 
-# Weekly rank recalculation (placeholder)
-def weekly_rank_recalculation():
+def daily_refresh():
+    job_name = "daily_refresh"
     try:
-        # Placeholder: Update leaderboard ranks
-        payload = {"ranks_updated": random.randint(10, 20)}  # Mock data
-        log_job("weekly_rank_recalculation", "success", payload)
-        print("Weekly rank recalculation completed")
+        users = supabase.table("users").select("id").execute().data
+        for user in users:
+            # Dummy score recalculation – replace with your real logic
+            user_id = user["id"]
+            new_score = 100  # Replace with actual score calculation
+            supabase.table("users").update({"behavior_score": new_score}).eq("id", user_id).execute()
+        log_job(job_name, "success", payload={"affected_users": len(users)})
     except Exception as e:
-        log_job("weekly_rank_recalculation", "failure", error_message=str(e))
-        print(f"Weekly rank recalculation failed: {e}")
+        tb = traceback.format_exc()
+        log_job(job_name, "error", error_message=f"{str(e)}\n{tb}")
 
-# Hourly anomaly check (placeholder)
-def hourly_anomaly_check():
+def weekly_ranks():
+    job_name = "weekly_ranks"
     try:
-        # Placeholder: Check for new anomalies
-        payload = {"anomalies_flagged": random.randint(0, 5)}  # Mock data
-        log_job("hourly_anomaly_check", "success", payload)
-        print("Hourly anomaly check completed")
+        users = supabase.table("users").select("id, behavior_score").order("behavior_score", desc=True).limit(100).execute().data
+        # Example: Top 100 leaderboard ranking – add your leaderboard update here
+        log_job(job_name, "success", payload={"top_users": [u["id"] for u in users]})
     except Exception as e:
-        log_job("hourly_anomaly_check", "failure", error_message=str(e))
-        print(f"Hourly anomaly check failed: {e}")
+        tb = traceback.format_exc()
+        log_job(job_name, "error", error_message=f"{str(e)}\n{tb}")
 
-# Schedule jobs for testing
-schedule.every(10).seconds.do(daily_score_refresh)
-schedule.every(20).seconds.do(weekly_rank_recalculation)
-schedule.every(30).seconds.do(hourly_anomaly_check)
+def hourly_anomaly_scan():
+    job_name = "hourly_anomaly_scan"
+    try:
+        # Query recent anomalies in user_risk_flags from the last hour
+        since = datetime.utcnow().isoformat()[:13]  # Get current UTC hour
+        flags = supabase.table("user_risk_flags").select("*").gte("timestamp", since).execute().data
+        log_job(job_name, "success", payload={"anomaly_count": len(flags)})
+    except Exception as e:
+        tb = traceback.format_exc()
+        log_job(job_name, "error", error_message=f"{str(e)}\n{tb}")
 
-# Main loop to run scheduled jobs
 def run_scheduler():
+    # Schedule jobs
+    schedule.every().day.at("00:01").do(daily_refresh)
+    schedule.every().monday.at("00:10").do(weekly_ranks)
+    schedule.every().hour.at(":00").do(hourly_anomaly_scan)
+
+    logger.info("Scheduled tasks started. Press Ctrl+C to exit.")
+
     while True:
         schedule.run_pending()
-        time.sleep(1)  # Changed to 1 second
+        time.sleep(10)
 
 if __name__ == "__main__":
-    print("Starting scheduler...")
     run_scheduler()
