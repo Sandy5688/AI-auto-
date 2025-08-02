@@ -1,154 +1,340 @@
 ################################################################
-##users_table
-create table public.users (
-  id text not null,
-  behavior_score integer null default 100,
-  role text null,
-  is_anonymous boolean null default false,
-  encrypted_token text null,
-  token_used integer null default 0,
-  constraint users_pkey primary key (id)
-) TABLESPACE pg_default;
+# BEHAVIOR SCORING ENGINE - COMPLETE SUPABASE SCHEMA
+# This file contains all table schemas required for the project
+################################################################
 
-##generated_memes
-create table public.generated_memes (
-  id uuid not null default extensions.uuid_generate_v4 (),
-  user_id text not null,
-  prompt text not null,
-  tone text null,
-  image_url text null,
-  timestamp timestamp with time zone null default now(),
-  token_used integer null,
-  used_in_nft boolean null default false,
-  constraint generated_memes_pkey primary key (id)
-) TABLESPACE pg_default;
+-- Enable UUID extension if not already enabled
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
-##user_risk_flags
-create table public.user_risk_flags (
-  id uuid not null default extensions.uuid_generate_v4 (),
-  user_id text not null,
-  flag text not null,
-  risk_score integer null,
-  anomalies text[] null,
-  timestamp timestamp with time zone null default now(),
-  constraint user_risk_flags_pkey primary key (id),
-  constraint user_risk_flags_user_id_key unique (user_id)
-) TABLESPACE pg_default;
+################################################################
+# CORE USER MANAGEMENT TABLES
+################################################################
 
-##token_usage_history
-create table public.token_usage_history (
-  id serial not null,
-  user_id text null,
-  tokens_used integer not null,
-  action text not null,
-  timestamp timestamp with time zone null default now(),
-  constraint token_usage_history_pkey primary key (id),
-  constraint token_usage_history_user_id_fkey foreign KEY (user_id) references users (id)
-) TABLESPACE pg_default;
-
-##job_logs
-create table public.job_logs (
-  id uuid not null default extensions.uuid_generate_v4 (),
-  job_name text not null,
-  status text not null,
-  timestamp timestamp with time zone null default now(),
-  payload jsonb null,
-  error_message text null,
-  constraint job_logs_pkey primary key (id)
-) TABLESPACE pg_default;
-
-#####################################################
--- Create table for tracking skipped payloads
-CREATE TABLE IF NOT EXISTS skipped_payloads (
-    id BIGSERIAL PRIMARY KEY,
-    payload JSONB,
-    reason TEXT NOT NULL,
-    timestamp TIMESTAMPTZ DEFAULT NOW(),
-    endpoint TEXT DEFAULT '/webhook'
+-- Main users table with enhanced fields
+CREATE TABLE IF NOT EXISTS public.users (
+    id TEXT NOT NULL,
+    behavior_score INTEGER DEFAULT 100,
+    role TEXT DEFAULT 'user',
+    is_anonymous BOOLEAN DEFAULT false,
+    encrypted_token TEXT,
+    token_used INTEGER DEFAULT 0,
+    is_verified BOOLEAN DEFAULT false,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    last_updated TIMESTAMPTZ DEFAULT NOW(),
+    token_updated_at TIMESTAMPTZ,
+    token_type TEXT DEFAULT 'api_token',
+    CONSTRAINT users_pkey PRIMARY KEY (id)
 );
 
--- Add index for faster queries
-CREATE INDEX IF NOT EXISTS idx_skipped_payloads_timestamp ON skipped_payloads(timestamp);
-CREATE INDEX IF NOT EXISTS idx_skipped_payloads_reason ON skipped_payloads(reason);
+-- Token usage history for tracking API usage
+CREATE TABLE IF NOT EXISTS public.token_usage_history (
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    tokens_used INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    timestamp TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT token_usage_history_user_id_fkey FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+);
 
--- Ensure user_risk_flags table has proper structure
-CREATE TABLE IF NOT EXISTS user_risk_flags (
+################################################################
+# RISK MANAGEMENT & FRAUD DETECTION TABLES
+################################################################
+
+-- User risk flags with enhanced structure
+CREATE TABLE IF NOT EXISTS public.user_risk_flags (
     id BIGSERIAL PRIMARY KEY,
     user_id TEXT NOT NULL,
     flag TEXT NOT NULL,
     timestamp TIMESTAMPTZ DEFAULT NOW(),
-    metadata JSONB DEFAULT '{}'::jsonb
+    metadata JSONB DEFAULT '{}'::jsonb,
+    risk_score INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'active'
 );
 
--- Add composite index to prevent duplicates and speed up queries
-CREATE UNIQUE INDEX IF NOT EXISTS idx_user_risk_flags_unique ON user_risk_flags(user_id, flag, timestamp);
+-- Remove the old unique constraint that was too restrictive
+DROP INDEX IF EXISTS idx_user_risk_flags_unique;
+
+-- Add better indexes for risk flags
 CREATE INDEX IF NOT EXISTS idx_user_risk_flags_user_id ON user_risk_flags(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_risk_flags_timestamp ON user_risk_flags(timestamp);
+CREATE INDEX IF NOT EXISTS idx_user_risk_flags_flag ON user_risk_flags(flag);
 
--- Create migration status tracking table
-CREATE TABLE IF NOT EXISTS migration_status (
+-- Detected anomalies from system monitoring
+CREATE TABLE IF NOT EXISTS public.detected_anomalies (
     id BIGSERIAL PRIMARY KEY,
-    migration_name TEXT UNIQUE NOT NULL,
-    completed BOOLEAN DEFAULT FALSE,
-    completed_at TIMESTAMPTZ,
-    migrated_users INTEGER DEFAULT 0,
-    error_count INTEGER DEFAULT 0,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    anomaly_type TEXT NOT NULL,
+    description TEXT NOT NULL,
+    severity TEXT DEFAULT 'medium' CHECK (severity IN ('low', 'medium', 'high', 'critical')),
+    affected_users TEXT[] DEFAULT '{}',
+    detected_at TIMESTAMPTZ DEFAULT NOW(),
+    metadata JSONB DEFAULT '{}'::jsonb,
+    resolved BOOLEAN DEFAULT false,
+    resolved_at TIMESTAMPTZ
 );
 
--- Add index for faster lookups
-CREATE INDEX IF NOT EXISTS idx_migration_status_name ON migration_status(migration_name);
+################################################################
+# CONTENT GENERATION TABLES
+################################################################
 
-#############################################################################
+-- Generated memes tracking
+CREATE TABLE IF NOT EXISTS public.generated_memes (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    tone TEXT,
+    image_url TEXT,
+    timestamp TIMESTAMPTZ DEFAULT NOW(),
+    tokens_used INTEGER DEFAULT 1,
+    used_in_nft BOOLEAN DEFAULT false,
+    generation_status TEXT DEFAULT 'completed',
+    api_response JSONB,
+    CONSTRAINT generated_memes_user_id_fkey FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+);
 
--- Enhanced job logs table (if not exists)
-CREATE TABLE IF NOT EXISTS job_logs (
+################################################################
+# SYSTEM OPERATIONS & MONITORING TABLES
+################################################################
+
+-- Job logs for scheduled tasks
+CREATE TABLE IF NOT EXISTS public.job_logs (
     id BIGSERIAL PRIMARY KEY,
     job_name TEXT NOT NULL,
-    status TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('running', 'success', 'failed', 'failed_after_retries', 'error')),
     timestamp TIMESTAMPTZ DEFAULT NOW(),
     payload JSONB DEFAULT '{}'::jsonb,
     error_message TEXT,
-    retry_count INTEGER DEFAULT 0
+    retry_count INTEGER DEFAULT 0,
+    execution_time_ms INTEGER,
+    server_info JSONB DEFAULT '{}'::jsonb
 );
 
--- System alerts table for failure notifications
-CREATE TABLE IF NOT EXISTS system_alerts (
+-- System alerts for operational monitoring
+CREATE TABLE IF NOT EXISTS public.system_alerts (
     id BIGSERIAL PRIMARY KEY,
     alert_type TEXT NOT NULL,
     operation TEXT NOT NULL,
     error_message TEXT,
     timestamp TIMESTAMPTZ DEFAULT NOW(),
-    severity TEXT DEFAULT 'medium',
-    status TEXT DEFAULT 'unresolved',
-    metadata JSONB DEFAULT '{}'::jsonb
+    severity TEXT DEFAULT 'medium' CHECK (severity IN ('low', 'medium', 'high', 'critical')),
+    status TEXT DEFAULT 'unresolved' CHECK (status IN ('unresolved', 'investigating', 'resolved', 'ignored')),
+    metadata JSONB DEFAULT '{}'::jsonb,
+    resolved_by TEXT,
+    resolved_at TIMESTAMPTZ
 );
 
--- Weekly rankings table
-CREATE TABLE IF NOT EXISTS weekly_rankings (
+-- Migration status tracking
+CREATE TABLE IF NOT EXISTS public.migration_status (
+    id BIGSERIAL PRIMARY KEY,
+    migration_name TEXT UNIQUE NOT NULL,
+    completed BOOLEAN DEFAULT false,
+    completed_at TIMESTAMPTZ,
+    migrated_users INTEGER DEFAULT 0,
+    error_count INTEGER DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    migration_metadata JSONB DEFAULT '{}'::jsonb
+);
+
+################################################################
+# WEBHOOK & API MONITORING TABLES
+################################################################
+
+-- Skipped payloads for webhook monitoring
+CREATE TABLE IF NOT EXISTS public.skipped_payloads (
+    id BIGSERIAL PRIMARY KEY,
+    payload JSONB,
+    reason TEXT NOT NULL,
+    timestamp TIMESTAMPTZ DEFAULT NOW(),
+    endpoint TEXT DEFAULT '/webhook',
+    source_ip INET,
+    user_agent TEXT,
+    error_code TEXT,
+    retry_attempted BOOLEAN DEFAULT false
+);
+
+################################################################
+# ANALYTICS & RANKING TABLES
+################################################################
+
+-- Weekly user rankings
+CREATE TABLE IF NOT EXISTS public.weekly_rankings (
     id BIGSERIAL PRIMARY KEY,
     user_id TEXT NOT NULL,
     rank INTEGER NOT NULL,
     behavior_score INTEGER NOT NULL,
     previous_rank INTEGER,
     rank_change INTEGER DEFAULT 0,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    week_of DATE,
+    percentile DECIMAL(5,2),
+    CONSTRAINT weekly_rankings_user_id_fkey FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 );
 
--- Detected anomalies table
-CREATE TABLE IF NOT EXISTS detected_anomalies (
-    id BIGSERIAL PRIMARY KEY,
-    anomaly_type TEXT NOT NULL,
-    description TEXT NOT NULL,
-    severity TEXT DEFAULT 'medium',
-    affected_users TEXT[] DEFAULT '{}',
-    detected_at TIMESTAMPTZ DEFAULT NOW(),
-    metadata JSONB DEFAULT '{}'::jsonb
-);
+################################################################
+# PERFORMANCE INDEXES
+################################################################
 
--- Add indexes for better performance
+-- Users table indexes
+CREATE INDEX IF NOT EXISTS idx_users_behavior_score ON users(behavior_score);
+CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at);
+CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+
+-- Token usage indexes
+CREATE INDEX IF NOT EXISTS idx_token_usage_user_id ON token_usage_history(user_id);
+CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage_history(timestamp);
+CREATE INDEX IF NOT EXISTS idx_token_usage_action ON token_usage_history(action);
+
+-- Generated memes indexes
+CREATE INDEX IF NOT EXISTS idx_generated_memes_user_id ON generated_memes(user_id);
+CREATE INDEX IF NOT EXISTS idx_generated_memes_timestamp ON generated_memes(timestamp);
+CREATE INDEX IF NOT EXISTS idx_generated_memes_tone ON generated_memes(tone);
+
+-- Job logs indexes
 CREATE INDEX IF NOT EXISTS idx_job_logs_job_name ON job_logs(job_name);
 CREATE INDEX IF NOT EXISTS idx_job_logs_timestamp ON job_logs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_job_logs_status ON job_logs(status);
+
+-- System alerts indexes
 CREATE INDEX IF NOT EXISTS idx_system_alerts_status ON system_alerts(status);
+CREATE INDEX IF NOT EXISTS idx_system_alerts_severity ON system_alerts(severity);
+CREATE INDEX IF NOT EXISTS idx_system_alerts_timestamp ON system_alerts(timestamp);
+
+-- Skipped payloads indexes
+CREATE INDEX IF NOT EXISTS idx_skipped_payloads_timestamp ON skipped_payloads(timestamp);
+CREATE INDEX IF NOT EXISTS idx_skipped_payloads_reason ON skipped_payloads(reason);
+CREATE INDEX IF NOT EXISTS idx_skipped_payloads_endpoint ON skipped_payloads(endpoint);
+
+-- Weekly rankings indexes
 CREATE INDEX IF NOT EXISTS idx_weekly_rankings_user_id ON weekly_rankings(user_id);
 CREATE INDEX IF NOT EXISTS idx_weekly_rankings_created_at ON weekly_rankings(created_at);
+CREATE INDEX IF NOT EXISTS idx_weekly_rankings_rank ON weekly_rankings(rank);
+CREATE INDEX IF NOT EXISTS idx_weekly_rankings_week_of ON weekly_rankings(week_of);
+
+-- Detected anomalies indexes
 CREATE INDEX IF NOT EXISTS idx_detected_anomalies_detected_at ON detected_anomalies(detected_at);
+CREATE INDEX IF NOT EXISTS idx_detected_anomalies_severity ON detected_anomalies(severity);
+CREATE INDEX IF NOT EXISTS idx_detected_anomalies_type ON detected_anomalies(anomaly_type);
+
+-- Migration status indexes
+CREATE INDEX IF NOT EXISTS idx_migration_status_name ON migration_status(migration_name);
+CREATE INDEX IF NOT EXISTS idx_migration_status_completed ON migration_status(completed);
+
+################################################################
+# ROW LEVEL SECURITY (RLS) POLICIES
+################################################################
+
+-- Enable RLS on sensitive tables
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_risk_flags ENABLE ROW LEVEL SECURITY;
+ALTER TABLE token_usage_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE generated_memes ENABLE ROW LEVEL SECURITY;
+
+-- Basic RLS policies (customize based on your auth system)
+CREATE POLICY "Users can view own data" ON users
+    FOR SELECT USING (auth.uid()::text = id);
+
+CREATE POLICY "Users can update own data" ON users
+    FOR UPDATE USING (auth.uid()::text = id);
+
+################################################################
+# HELPFUL VIEWS FOR ANALYTICS
+################################################################
+
+-- User behavior summary view
+CREATE OR REPLACE VIEW user_behavior_summary AS
+SELECT 
+    u.id,
+    u.behavior_score,
+    u.token_used,
+    u.created_at,
+    COUNT(urf.id) as total_risk_flags,
+    COUNT(gm.id) as total_memes_generated,
+    MAX(urf.timestamp) as last_flag_date,
+    MAX(gm.timestamp) as last_meme_date
+FROM users u
+LEFT JOIN user_risk_flags urf ON u.id = urf.user_id
+LEFT JOIN generated_memes gm ON u.id = gm.user_id
+GROUP BY u.id, u.behavior_score, u.token_used, u.created_at;
+
+-- System health monitoring view
+CREATE OR REPLACE VIEW system_health_summary AS
+SELECT 
+    DATE(timestamp) as date,
+    COUNT(*) as total_jobs,
+    COUNT(CASE WHEN status = 'success' THEN 1 END) as successful_jobs,
+    COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_jobs,
+    ROUND(COUNT(CASE WHEN status = 'success' THEN 1 END) * 100.0 / COUNT(*), 2) as success_rate
+FROM job_logs
+WHERE timestamp >= NOW() - INTERVAL '30 days'
+GROUP BY DATE(timestamp)
+ORDER BY date DESC;
+
+################################################################
+# DATA CLEANUP PROCEDURES
+################################################################
+
+-- Function to clean old logs (run periodically)
+CREATE OR REPLACE FUNCTION cleanup_old_logs() RETURNS void AS $$
+BEGIN
+    -- Clean job logs older than 90 days
+    DELETE FROM job_logs WHERE timestamp < NOW() - INTERVAL '90 days';
+    
+    -- Clean skipped payloads older than 30 days
+    DELETE FROM skipped_payloads WHERE timestamp < NOW() - INTERVAL '30 days';
+    
+    -- Clean resolved alerts older than 60 days
+    DELETE FROM system_alerts 
+    WHERE status = 'resolved' AND resolved_at < NOW() - INTERVAL '60 days';
+    
+    -- Clean old weekly rankings (keep only last 52 weeks)
+    DELETE FROM weekly_rankings 
+    WHERE created_at < NOW() - INTERVAL '52 weeks';
+    
+    RAISE NOTICE 'Old logs cleanup completed';
+END;
+$$ LANGUAGE plpgsql;
+
+################################################################
+# INITIAL DATA SETUP
+################################################################
+
+-- Insert default system user for automated processes
+INSERT INTO users (id, role, behavior_score, is_anonymous) 
+VALUES ('system', 'system', 100, false)
+ON CONFLICT (id) DO NOTHING;
+
+-- Insert sample migration status for testing
+INSERT INTO migration_status (migration_name, completed, completed_at)
+VALUES ('initial_setup', true, NOW())
+ON CONFLICT (migration_name) DO NOTHING;
+
+################################################################
+# SCHEMA VERSION TRACKING
+################################################################
+
+-- Track schema version for future migrations
+CREATE TABLE IF NOT EXISTS schema_version (
+    version TEXT PRIMARY KEY,
+    applied_at TIMESTAMPTZ DEFAULT NOW(),
+    description TEXT
+);
+
+INSERT INTO schema_version (version, description)
+VALUES ('1.0.0', 'Complete BSE schema with all enhancements')
+ON CONFLICT (version) DO NOTHING;
+
+################################################################
+# USEFUL COMMENTS FOR MAINTENANCE
+################################################################
+
+COMMENT ON TABLE users IS 'Core user data with behavior scoring and token management';
+COMMENT ON TABLE user_risk_flags IS 'Risk flags for fraud detection and behavior analysis';
+COMMENT ON TABLE generated_memes IS 'Tracking of all generated meme content';
+COMMENT ON TABLE job_logs IS 'System job execution logs for monitoring';
+COMMENT ON TABLE system_alerts IS 'Operational alerts and system monitoring';
+COMMENT ON TABLE weekly_rankings IS 'User ranking system based on behavior scores';
+COMMENT ON TABLE detected_anomalies IS 'Automated anomaly detection results';
+COMMENT ON TABLE skipped_payloads IS 'Webhook monitoring and error tracking';
+COMMENT ON TABLE migration_status IS 'Database migration tracking';
+
+-- End of Schema
+################################################################
