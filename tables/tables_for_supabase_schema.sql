@@ -97,3 +97,58 @@ CREATE TABLE IF NOT EXISTS migration_status (
 
 -- Add index for faster lookups
 CREATE INDEX IF NOT EXISTS idx_migration_status_name ON migration_status(migration_name);
+
+#############################################################################
+
+-- Enhanced job logs table (if not exists)
+CREATE TABLE IF NOT EXISTS job_logs (
+    id BIGSERIAL PRIMARY KEY,
+    job_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    timestamp TIMESTAMPTZ DEFAULT NOW(),
+    payload JSONB DEFAULT '{}'::jsonb,
+    error_message TEXT,
+    retry_count INTEGER DEFAULT 0
+);
+
+-- System alerts table for failure notifications
+CREATE TABLE IF NOT EXISTS system_alerts (
+    id BIGSERIAL PRIMARY KEY,
+    alert_type TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    error_message TEXT,
+    timestamp TIMESTAMPTZ DEFAULT NOW(),
+    severity TEXT DEFAULT 'medium',
+    status TEXT DEFAULT 'unresolved',
+    metadata JSONB DEFAULT '{}'::jsonb
+);
+
+-- Weekly rankings table
+CREATE TABLE IF NOT EXISTS weekly_rankings (
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    rank INTEGER NOT NULL,
+    behavior_score INTEGER NOT NULL,
+    previous_rank INTEGER,
+    rank_change INTEGER DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Detected anomalies table
+CREATE TABLE IF NOT EXISTS detected_anomalies (
+    id BIGSERIAL PRIMARY KEY,
+    anomaly_type TEXT NOT NULL,
+    description TEXT NOT NULL,
+    severity TEXT DEFAULT 'medium',
+    affected_users TEXT[] DEFAULT '{}',
+    detected_at TIMESTAMPTZ DEFAULT NOW(),
+    metadata JSONB DEFAULT '{}'::jsonb
+);
+
+-- Add indexes for better performance
+CREATE INDEX IF NOT EXISTS idx_job_logs_job_name ON job_logs(job_name);
+CREATE INDEX IF NOT EXISTS idx_job_logs_timestamp ON job_logs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_system_alerts_status ON system_alerts(status);
+CREATE INDEX IF NOT EXISTS idx_weekly_rankings_user_id ON weekly_rankings(user_id);
+CREATE INDEX IF NOT EXISTS idx_weekly_rankings_created_at ON weekly_rankings(created_at);
+CREATE INDEX IF NOT EXISTS idx_detected_anomalies_detected_at ON detected_anomalies(detected_at);
