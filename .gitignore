@@ -1,23 +1,40 @@
-# Ignore environment variables
+# Environment variables
 config/.env
+.env
+*.env
 
-# Ignore Python cache and virtual environment
+# Python
 __pycache__/
-venv/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Ignore IDE-specific files
+# IDE
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# Ignore local test data
-tests/local_*.sql
+# Logs
+*.log
+logs/
 
-# Ignore macOS system files
+# OS
 .DS_Store
-
-# Ignore large/local meme assets
-*.jpg
-*.png
-!docs/*.png  # Except images in /docs
-.env
-src/sol1.py
+Thumbs.db
