@@ -3,6 +3,14 @@ import logging
 from datetime import datetime, timezone
 from supabase import create_client
 from dotenv import load_dotenv
+import requests
+import time
+
+
+WEBHOOK_MAX_RETRIES = 3
+WEBHOOK_RETRY_DELAY = 2  # seconds
+WEBHOOK_EXPONENTIAL_BACKOFF = True
+WEBHOOK_TIMEOUT = 30  # seconds
 
 # Dynamically find the config/.env file regardless of current working directory
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -200,10 +208,8 @@ def calculate_score(payload):
 
 def send_score_to_webhook(user_id, score, risk_flags, timestamp=None):
     """
-    Enhanced webhook sender with better error handling and duplicate prevention.
+    Enhanced webhook sender with retry logic, exponential backoff, and comprehensive error handling.
     """
-    import requests
-    
     if not timestamp:
         timestamp = datetime.now(timezone.utc)
     elif isinstance(timestamp, str):
@@ -221,16 +227,85 @@ def send_score_to_webhook(user_id, score, risk_flags, timestamp=None):
         "timestamp": timestamp.isoformat().replace("+00:00", "Z")
     }
     
-    try:
-        response = requests.post(WEBHOOK_URL, json=payload, timeout=30)
-        if response.status_code == 200:
-            logger.info(f"Score sent to webhook for user {user_id}")
-        else:
-            logger.warning(f"Failed to send score for user {user_id}: {response.status_code} {response.text}")
-    except requests.exceptions.Timeout:
-        logger.error(f"Webhook timeout for user {user_id}")
-    except Exception as e:
-        logger.error(f"Exception in send_score_to_webhook: {e}")
+    # Webhook retry logic with exponential backoff
+    for attempt in range(1, WEBHOOK_MAX_RETRIES + 1):
+        try:
+            logger.info(f"Sending webhook payload to {WEBHOOK_URL} (attempt {attempt}/{WEBHOOK_MAX_RETRIES})")
+            
+            response = requests.post(
+                WEBHOOK_URL, 
+                json=payload, 
+                timeout=WEBHOOK_TIMEOUT,
+                headers={
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'BSE-Webhook-Client/1.0'
+                }
+            )
+            
+            if response.status_code == 200:
+                logger.info(f"✅ Webhook sent successfully for user {user_id} on attempt {attempt}")
+                return True
+            elif response.status_code in [429, 502, 503, 504]:
+                # Retriable errors
+                logger.warning(f"⚠️  Webhook returned retriable error {response.status_code} for user {user_id}: {response.text}")
+                raise requests.exceptions.HTTPError(f"HTTP {response.status_code}: {response.text}")
+            else:
+                # Non-retriable errors
+                logger.error(f"❌ Webhook failed with non-retriable error {response.status_code} for user {user_id}: {response.text}")
+                return False
+                
+        except requests.exceptions.Timeout:
+            logger.warning(f"⏰ Webhook timeout for user {user_id} on attempt {attempt}/{WEBHOOK_MAX_RETRIES}")
+            if attempt == WEBHOOK_MAX_RETRIES:
+                logger.error(f"💥 Webhook failed after {WEBHOOK_MAX_RETRIES} timeout attempts for user {user_id}")
+                return False
+                
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"🔌 Webhook connection error for user {user_id} on attempt {attempt}/{WEBHOOK_MAX_RETRIES}: {e}")
+            if attempt == WEBHOOK_MAX_RETRIES:
+                logger.error(f"💥 Webhook failed after {WEBHOOK_MAX_RETRIES} connection attempts for user {user_id}")
+                return False
+                
+        except requests.exceptions.HTTPError as e:
+            logger.warning(f"📡 Webhook HTTP error for user {user_id} on attempt {attempt}/{WEBHOOK_MAX_RETRIES}: {e}")
+            if attempt == WEBHOOK_MAX_RETRIES:
+                logger.error(f"💥 Webhook failed after {WEBHOOK_MAX_RETRIES} HTTP error attempts for user {user_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"💥 Unexpected webhook error for user {user_id} on attempt {attempt}/{WEBHOOK_MAX_RETRIES}: {e}")
+            if attempt == WEBHOOK_MAX_RETRIES:
+                logger.error(f"💥 Webhook failed after {WEBHOOK_MAX_RETRIES} attempts with unexpected error for user {user_id}")
+                return False
+        
+        # Calculate retry delay with exponential backoff
+        if attempt < WEBHOOK_MAX_RETRIES:
+            if WEBHOOK_EXPONENTIAL_BACKOFF:
+                delay = WEBHOOK_RETRY_DELAY * (2 ** (attempt - 1))
+            else:
+                delay = WEBHOOK_RETRY_DELAY
+            
+            logger.info(f"⏳ Retrying webhook for user {user_id} in {delay} seconds...")
+            time.sleep(delay)
+    
+    return False
+
+def send_score_to_webhook_async(user_id, score, risk_flags, timestamp=None):
+    """
+    Optional: Asynchronous webhook sender to avoid blocking main thread.
+    """
+    import threading
+    
+    def webhook_worker():
+        try:
+            send_score_to_webhook(user_id, score, risk_flags, timestamp)
+        except Exception as e:
+            logger.error(f"Async webhook error for user {user_id}: {e}")
+    
+    thread = threading.Thread(target=webhook_worker, daemon=True)
+    thread.start()
+    logger.info(f"🚀 Async webhook queued for user {user_id}")
+
 
 if __name__ == "__main__":
     # Enhanced test payloads with new detection scenarios
