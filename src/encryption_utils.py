@@ -2,9 +2,12 @@ from cryptography.fernet import Fernet
 import os
 from dotenv import load_dotenv
 
-load_dotenv("../config/.env") # Adjust as above!
+# Standardized path - always use config/.env from project root
+load_dotenv("config/.env")
+
 KEY = os.getenv("TOKEN_ENCRYPTION_KEY")
-print("Loaded key from env:", KEY)  # Should print your key, not None!
+if not KEY:
+    raise ValueError("TOKEN_ENCRYPTION_KEY must be set in config/.env file")
 
 fernet = Fernet(KEY.encode())
 

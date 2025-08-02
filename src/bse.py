@@ -4,19 +4,22 @@ from datetime import datetime, timezone
 from supabase import create_client
 from dotenv import load_dotenv
 
-# Load environment variables from config
-load_dotenv("../config/.env")
-
+# Standardized path - load from config/.env
+load_dotenv("config/.env")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
+# Validate environment variables
+if not all([SUPABASE_URL, SUPABASE_KEY, WEBHOOK_URL]):
+    raise ValueError("SUPABASE_URL, SUPABASE_KEY, and WEBHOOK_URL must be set in config/.env")
+
 # Initialize logger
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Initialize Supabase client if needed for saving scores
+# Initialize Supabase client
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Define known IPs for fake referral detection
