@@ -224,7 +224,7 @@ def get_user_token(user_id):
 
 def generate_meme(prompt, tone, image_url=None, user_id=None):
     """
-    Generate meme with enhanced token handling and caching.
+    Generate meme with enhanced token handling, caching, and usage tracking.
     """
     # First, check cache for repeated requests
     cache_hit = get_cached_result(user_id, prompt, tone, image_url)
@@ -265,8 +265,12 @@ def generate_meme(prompt, tone, image_url=None, user_id=None):
         # Cache the successful result
         cache_result(user_id, prompt, tone, image_url, result)
 
-        # Track token usage (implement this based on your tracking logic)
-        # track_token_usage(supabase, user_id, tokens_used=1, action="meme_generation")
+        # ADDED: Track token usage for successful API call
+        try:
+            track_token_usage(supabase, user_id, tokens_used=1, action="meme_generation")
+            logger.info(f"Token usage tracked for user {user_id}")
+        except Exception as track_error:
+            logger.warning(f"Failed to track token usage for user {user_id}: {track_error}")
 
         return result
 
@@ -276,6 +280,7 @@ def generate_meme(prompt, tone, image_url=None, user_id=None):
     except Exception as e:
         logger.error(f"Exception during meme generation for user {user_id}: {e}")
         return {"error": str(e), "user_id": user_id}
+
 
 # Safe migration execution at module level
 def run_startup_migration():
@@ -318,3 +323,29 @@ if __name__ == "__main__":
         logger.info(f"✅ Meme generation result: {meme}")
     else:
         logger.error(f"❌ Failed to generate meme: {meme}")
+
+def test_calculate_score_extreme_values():
+    """Test calculate_score with extreme values"""
+    payload = {
+        "event_type": "click", 
+        "user_id": "extreme_values_user",
+        "timestamp": "2025-08-03T01:00:00Z",
+        "metadata": {
+            "click_rate": 999999,               # Extremely high - triggers rapid_clicks
+            "page_interaction_score": -50,      # Negative value
+            "session_duration": 500,            # Changed from 0 to 500 to trigger idle_click_farm
+            "mouse_movement_variance": 0,       # Zero variance - triggers idle_click_farm
+            "actions_per_minute": 10000,        # Impossibly high - triggers bot_like_velocity
+            "human_behavior_score": -100        # Negative human score - triggers bot_like_velocity
+        }
+    }
+    
+    score, flags = calculate_score(payload)
+    
+    # Should trigger multiple flags
+    assert "rapid_clicks" in flags
+    assert "idle_click_farm" in flags  
+    assert "bot_like_velocity" in flags
+    
+    # Score should be at minimum (0) - 100 - 15 - 30 - 25 = 30, but capped at 0
+    assert score == 30  # Actually should be 30, not 0

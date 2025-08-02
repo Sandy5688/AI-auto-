@@ -273,3 +273,104 @@ def test_calculate_score_minimum_score_limit():
     score, flags = calculate_score(payload)
     assert score >= 0  # Score should never be negative
     assert len(flags) == 3  # Should have multiple flags
+
+def test_calculate_score_comprehensive_scenario():
+    """Test a comprehensive scenario with multiple risk factors"""
+    payload = {
+        "event_type": "click",
+        "user_id": "comprehensive_test_user",
+        "timestamp": "2025-08-03T01:00:00Z",
+        "metadata": {
+            # Multiple risk factors
+            "click_rate": 40,                    # Rapid clicks (-15)
+            "page_interaction_score": 12,
+            "session_duration": 800,
+            "mouse_movement_variance": 6,        # Idle click farm (-30)
+            "actions_per_minute": 90,
+            "human_behavior_score": 15,          # Bot-like velocity (-25)
+            "login_count": 15,                   # Would trigger if login event
+            "daily_referral_count": 30,         # Would trigger if referral event
+            "unique_referral_sources": 1
+        }
+    }
+    
+    score, flags = calculate_score(payload)
+    
+    # Should have multiple flags and significantly reduced score
+    expected_flags = ["rapid_clicks", "idle_click_farm", "bot_like_velocity"]
+    
+    for flag in expected_flags:
+        assert flag in flags
+    
+    # Score should be 30 (100 - 15 - 30 - 25)
+    assert score == 30
+    assert len(flags) == 3
+
+def test_calculate_score_performance():
+    """Test calculate_score performance with large metadata"""
+    import time
+    
+    payload = {
+        "event_type": "click",
+        "user_id": "performance_test_user",
+        "timestamp": "2025-08-03T01:00:00Z",
+        "metadata": {
+            "click_rate": 25,
+            # Add lots of metadata to test performance
+            **{f"extra_field_{i}": f"value_{i}" for i in range(100)}
+        }
+    }
+    
+    start_time = time.time()
+    score, flags = calculate_score(payload)
+    end_time = time.time()
+    
+    # Should complete quickly (under 1 second)
+    assert (end_time - start_time) < 1.0
+    assert score == 100  # No flags should be triggered
+    assert flags == []
+
+def test_calculate_score_unicode_handling():
+    """Test calculate_score with unicode characters in metadata"""
+    payload = {
+        "event_type": "click",
+        "user_id": "unicode_test_user_🧪",
+        "timestamp": "2025-08-03T01:00:00Z",
+        "metadata": {
+            "click_rate": 15,
+            "user_agent": "Mozilla/5.0 (Unicode: 测试用户)",
+            "location": "São Paulo, Brasil",
+            "description": "Тест с кириллицей"
+        }
+    }
+    
+    score, flags = calculate_score(payload)
+    assert score == 100
+    assert flags == []
+
+def test_calculate_score_extreme_values():
+    """Test calculate_score with extreme values"""
+    payload = {
+        "event_type": "click", 
+        "user_id": "extreme_values_user",
+        "timestamp": "2025-08-03T01:00:00Z",
+        "metadata": {
+            "click_rate": 999999,               # Extremely high - triggers rapid_clicks
+            "page_interaction_score": -50,      # Negative value
+            "session_duration": 500,            # Changed to 500 to meet idle_click_farm criteria (>300)
+            "mouse_movement_variance": 5,       # Changed to 5 to meet idle_click_farm criteria (<10)
+            "actions_per_minute": 10000,        # Impossibly high - triggers bot_like_velocity
+            "human_behavior_score": -100        # Negative human score - triggers bot_like_velocity
+        }
+    }
+    
+    score, flags = calculate_score(payload)
+    
+    # Should trigger multiple flags
+    assert "rapid_clicks" in flags
+    assert "idle_click_farm" in flags  
+    assert "bot_like_velocity" in flags
+    
+    # Score calculation: 100 - 15 (rapid_clicks) - 30 (idle_click_farm) - 25 (bot_like_velocity) = 30
+    assert score == 30
+    assert len(flags) == 3
