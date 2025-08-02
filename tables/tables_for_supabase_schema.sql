@@ -1,29 +1,3 @@
--- Create table for tracking skipped payloads
-CREATE TABLE IF NOT EXISTS skipped_payloads (
-    id BIGSERIAL PRIMARY KEY,
-    payload JSONB,
-    reason TEXT NOT NULL,
-    timestamp TIMESTAMPTZ DEFAULT NOW(),
-    endpoint TEXT DEFAULT '/webhook'
-);
-
--- Add index for faster queries
-CREATE INDEX IF NOT EXISTS idx_skipped_payloads_timestamp ON skipped_payloads(timestamp);
-CREATE INDEX IF NOT EXISTS idx_skipped_payloads_reason ON skipped_payloads(reason);
-
--- Ensure user_risk_flags table has proper structure
-CREATE TABLE IF NOT EXISTS user_risk_flags (
-    id BIGSERIAL PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    flag TEXT NOT NULL,
-    timestamp TIMESTAMPTZ DEFAULT NOW(),
-    metadata JSONB DEFAULT '{}'::jsonb
-);
-
--- Add composite index to prevent duplicates and speed up queries
-CREATE UNIQUE INDEX IF NOT EXISTS idx_user_risk_flags_unique ON user_risk_flags(user_id, flag, timestamp);
-CREATE INDEX IF NOT EXISTS idx_user_risk_flags_user_id ON user_risk_flags(user_id);
-
 ################################################################
 ##users_table
 create table public.users (
@@ -82,3 +56,44 @@ create table public.job_logs (
   error_message text null,
   constraint job_logs_pkey primary key (id)
 ) TABLESPACE pg_default;
+
+#####################################################
+-- Create table for tracking skipped payloads
+CREATE TABLE IF NOT EXISTS skipped_payloads (
+    id BIGSERIAL PRIMARY KEY,
+    payload JSONB,
+    reason TEXT NOT NULL,
+    timestamp TIMESTAMPTZ DEFAULT NOW(),
+    endpoint TEXT DEFAULT '/webhook'
+);
+
+-- Add index for faster queries
+CREATE INDEX IF NOT EXISTS idx_skipped_payloads_timestamp ON skipped_payloads(timestamp);
+CREATE INDEX IF NOT EXISTS idx_skipped_payloads_reason ON skipped_payloads(reason);
+
+-- Ensure user_risk_flags table has proper structure
+CREATE TABLE IF NOT EXISTS user_risk_flags (
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    flag TEXT NOT NULL,
+    timestamp TIMESTAMPTZ DEFAULT NOW(),
+    metadata JSONB DEFAULT '{}'::jsonb
+);
+
+-- Add composite index to prevent duplicates and speed up queries
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_risk_flags_unique ON user_risk_flags(user_id, flag, timestamp);
+CREATE INDEX IF NOT EXISTS idx_user_risk_flags_user_id ON user_risk_flags(user_id);
+
+-- Create migration status tracking table
+CREATE TABLE IF NOT EXISTS migration_status (
+    id BIGSERIAL PRIMARY KEY,
+    migration_name TEXT UNIQUE NOT NULL,
+    completed BOOLEAN DEFAULT FALSE,
+    completed_at TIMESTAMPTZ,
+    migrated_users INTEGER DEFAULT 0,
+    error_count INTEGER DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Add index for faster lookups
+CREATE INDEX IF NOT EXISTS idx_migration_status_name ON migration_status(migration_name);
