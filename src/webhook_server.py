@@ -5,12 +5,14 @@ import logging
 import hmac
 import hashlib
 import json
+import requests
 from flask_cors import CORS
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from functools import wraps
+from typing import Dict, List, Any, Optional
 
 # Dynamically find the config/.env file
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -23,14 +25,12 @@ app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
 # FIXED: Updated Flask-Limiter initialization for newer versions
-# Correct Flask-Limiter initialization (from docs)
 limiter = Limiter(
     key_func=get_remote_address,
     app=app,
     default_limits=["200 per day", "50 per hour"],
     storage_uri="memory://"
 )
-
 
 # Logger setup with unified format
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -45,6 +45,19 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
 WEBHOOK_AUTH_METHOD = os.getenv("WEBHOOK_AUTH_METHOD", "signature")  # "signature" or "token"
 
+# NEW: BSE Integration Configuration
+BSE_ENABLED = os.getenv("BSE_ENABLED", "true").lower() == "true"
+BSE_ENDPOINT = os.getenv("BSE_ENDPOINT", "http://localhost:5000/process")
+BSE_ASYNC_PROCESSING = os.getenv("BSE_ASYNC_PROCESSING", "true").lower() == "true"
+
+# NEW: Bot Detection Integration
+BOT_DETECTION_WEBHOOK_ENABLED = os.getenv("BOT_DETECTION_WEBHOOK_ENABLED", "true").lower() == "true"
+FINGERPRINTJS_API_KEY = os.getenv("FINGERPRINTJS_API_KEY")
+IPHUB_API_KEY = os.getenv("IPHUB_API_KEY")
+
+# Enhanced rate limiting for bot detection
+BOT_DETECTION_RATE_LIMIT = os.getenv("BOT_DETECTION_RATE_LIMIT", "20 per hour")
+
 # Validate environment variables
 if not all([SUPABASE_URL, SUPABASE_KEY]):
     raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in config/.env")
@@ -57,7 +70,7 @@ if WEBHOOK_AUTH_METHOD == "token" and not WEBHOOK_TOKEN:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Error response templates
+# Enhanced error response templates
 ERROR_RESPONSES = {
     "MISSING_AUTH": {
         "status": "error",
@@ -98,20 +111,128 @@ ERROR_RESPONSES = {
         "status": "error",
         "error_code": "INTERNAL_ERROR",
         "message": "Internal server error"
+    },
+    # NEW: Bot detection specific errors
+    "BOT_DETECTED": {
+        "status": "error",
+        "error_code": "BOT_DETECTED",
+        "message": "Bot activity detected - request rejected"
+    },
+    "FAKE_REFERRAL_DETECTED": {
+        "status": "error",
+        "error_code": "FAKE_REFERRAL_DETECTED",
+        "message": "Fake referral detected - request rejected"
+    },
+    "BSE_PROCESSING_ERROR": {
+        "status": "error",
+        "error_code": "BSE_PROCESSING_ERROR",
+        "message": "Behavioral scoring engine processing failed"
     }
 }
 
-def verify_webhook_signature(payload_body: bytes, signature_header: str) -> bool:
-    """
-    Verify webhook signature using HMAC-SHA256.
+# NEW: Bot Detection Classes (Simplified for webhook server)
+class BotDetectionService:
+    """Simplified bot detection service for webhook server"""
     
-    Args:
-        payload_body: Raw request body as bytes
-        signature_header: Signature from request header
+    @staticmethod
+    def extract_bot_signals(request_data: Dict[str, Any], headers: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract bot detection signals from request"""
+        signals = {
+            "ip_address": request.remote_addr,
+            "user_agent": headers.get('User-Agent', ''),
+            "fingerprint_id": request_data.get("fingerprint_id"),
+            "bot_probability": 0.0,
+            "bot_signals": []
+        }
         
-    Returns:
-        bool: True if signature is valid, False otherwise
-    """
+        # Quick bot detection based on user agent
+        user_agent = signals["user_agent"].lower()
+        if any(term in user_agent for term in ["bot", "crawler", "spider", "scraper"]):
+            signals["bot_probability"] = 0.9
+            signals["bot_signals"].append("bot_user_agent")
+        
+        # Check for missing user agent
+        if not signals["user_agent"] or len(signals["user_agent"]) < 20:
+            signals["bot_probability"] = max(signals["bot_probability"], 0.6)
+            signals["bot_signals"].append("suspicious_user_agent")
+        
+        # Check for automated request patterns
+        if not signals["fingerprint_id"]:
+            signals["bot_probability"] = max(signals["bot_probability"], 0.4)
+            signals["bot_signals"].append("missing_fingerprint")
+        
+        return signals
+    
+    @staticmethod
+    def should_reject_bot(bot_signals: Dict[str, Any]) -> tuple[bool, str]:
+        """Determine if request should be rejected due to bot activity"""
+        bot_probability = bot_signals.get("bot_probability", 0.0)
+        signals = bot_signals.get("bot_signals", [])
+        
+        # High confidence bot detection
+        if bot_probability > 0.8:
+            return True, f"High bot probability: {bot_probability:.2f}"
+        
+        # Multiple bot signals
+        if len(signals) >= 2:
+            return True, f"Multiple bot signals detected: {', '.join(signals)}"
+        
+        return False, ""
+
+class FakeReferralDetectionService:
+    """Simplified fake referral detection for webhook server"""
+    
+    @staticmethod
+    def detect_fake_referral_patterns(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect fake referral patterns in webhook payload"""
+        event_type = payload.get("event_type", "")
+        
+        if event_type != "referral":
+            return {"is_fake": False, "signals": []}
+        
+        user_id = payload.get("user_id")
+        metadata = payload.get("metadata", {})
+        referred_user_id = metadata.get("referred_user_id")
+        ip_address = metadata.get("ip_address")
+        
+        fake_signals = []
+        
+        try:
+            # Quick check for same IP referrals
+            if ip_address and user_id and referred_user_id:
+                recent_time = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+                
+                # Check for multiple referrals from same IP
+                recent_referrals = supabase.table("user_risk_flags").select("*").eq("flag", "referral_activity").gte("timestamp", recent_time).execute()
+                
+                ip_count = 0
+                for referral in (recent_referrals.data or []):
+                    ref_metadata = referral.get("metadata", {})
+                    if isinstance(ref_metadata, dict) and ref_metadata.get("ip_address") == ip_address:
+                        ip_count += 1
+                
+                if ip_count > 3:
+                    fake_signals.append("excessive_ip_referrals")
+            
+            # Check referral velocity
+            if user_id:
+                user_referrals_today = supabase.table("user_risk_flags").select("id", count="exact").eq("user_id", user_id).eq("flag", "referral_activity").gte("timestamp", datetime.utcnow().strftime("%Y-%m-%d")).execute()
+                
+                if (user_referrals_today.count or 0) > 10:
+                    fake_signals.append("excessive_user_referrals")
+        
+        except Exception as e:
+            logger.warning(f"Error in fake referral detection: {e}")
+        
+        return {
+            "is_fake": len(fake_signals) > 0,
+            "signals": fake_signals,
+            "risk_score": len(fake_signals) * 25  # 25 points per signal
+        }
+
+# Keep all your existing authentication functions...
+def verify_webhook_signature(payload_body: bytes, signature_header: str) -> bool:
+    """Verify webhook signature using HMAC-SHA256."""
     if not signature_header:
         logger.warning("Missing signature header")
         return False
@@ -144,15 +265,7 @@ def verify_webhook_signature(payload_body: bytes, signature_header: str) -> bool
         return False
 
 def verify_webhook_token(token_header: str) -> bool:
-    """
-    Verify webhook using bearer token authentication.
-    
-    Args:
-        token_header: Authorization header value
-        
-    Returns:
-        bool: True if token is valid, False otherwise
-    """
+    """Verify webhook using bearer token authentication."""
     if not token_header:
         logger.warning("Missing authorization header")
         return False
@@ -178,9 +291,7 @@ def verify_webhook_token(token_header: str) -> bool:
         return False
 
 def require_webhook_auth(f):
-    """
-    Decorator to enforce webhook authentication.
-    """
+    """Decorator to enforce webhook authentication."""
     @wraps(f)
     def decorated_function(*args, **kwargs):
         try:
@@ -226,10 +337,58 @@ def require_webhook_auth(f):
         return f(*args, **kwargs)
     return decorated_function
 
+# NEW: Bot detection decorator
+def require_bot_detection(f):
+    """Decorator to perform bot detection on requests"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not BOT_DETECTION_WEBHOOK_ENABLED:
+            return f(*args, **kwargs)
+        
+        try:
+            # Extract bot detection signals
+            bot_signals = BotDetectionService.extract_bot_signals(
+                request.get_json(silent=True) or {}, 
+                dict(request.headers)
+            )
+            
+            # Check if request should be rejected
+            should_reject, reason = BotDetectionService.should_reject_bot(bot_signals)
+            
+            if should_reject:
+                logger.warning(f"🤖 Bot detected from {request.remote_addr}: {reason}")
+                
+                # Log bot detection
+                try:
+                    supabase.table("bot_detections").insert({
+                        "ip_address": request.remote_addr,
+                        "user_agent": bot_signals.get("user_agent", ""),
+                        "bot_probability": bot_signals.get("bot_probability", 0.0),
+                        "bot_signals": bot_signals.get("bot_signals", []),
+                        "rejection_reason": reason,
+                        "endpoint": request.endpoint,
+                        "timestamp": datetime.utcnow().isoformat() + "Z"
+                    }).execute()
+                except Exception as log_error:
+                    logger.error(f"Failed to log bot detection: {log_error}")
+                
+                error_response = ERROR_RESPONSES["BOT_DETECTED"].copy()
+                error_response["bot_signals"] = bot_signals.get("bot_signals", [])
+                error_response["bot_probability"] = bot_signals.get("bot_probability", 0.0)
+                return jsonify(error_response), 403
+            
+            # Add bot signals to request context for downstream processing
+            request.bot_signals = bot_signals
+            
+        except Exception as e:
+            logger.error(f"Bot detection error: {e}")
+            # Continue processing on bot detection errors
+        
+        return f(*args, **kwargs)
+    return decorated_function
+
 def log_skipped_payload(payload, reason, error_code=None):
-    """
-    Log skipped/ignored payloads with detailed information.
-    """
+    """Log skipped/ignored payloads with detailed information."""
     logger.warning(f"🚫 PAYLOAD SKIPPED - Reason: {reason}")
     logger.warning(f"   Error Code: {error_code}")
     logger.warning(f"   Payload content: {payload}")
@@ -251,12 +410,7 @@ def log_skipped_payload(payload, reason, error_code=None):
         logger.error(f"Failed to log skipped payload to database: {e}")
 
 def classify_database_error(error_message: str) -> tuple:
-    """
-    Classify database errors and return appropriate HTTP status code and error type.
-    
-    Returns:
-        tuple: (http_status_code, error_code, user_message)
-    """
+    """Classify database errors and return appropriate HTTP status code and error type."""
     error_lower = str(error_message).lower()
     
     # Connection/Network errors -> 502 Bad Gateway
@@ -278,9 +432,47 @@ def classify_database_error(error_message: str) -> tuple:
     # Generic database errors -> 500 Internal Server Error
     return 500, "DATABASE_ERROR", "Database operation failed"
 
+# NEW: BSE Integration Functions
+def send_to_bse(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Send payload to BSE for processing"""
+    try:
+        # Add request metadata
+        enhanced_payload = payload.copy()
+        enhanced_payload["request_metadata"] = {
+            "source_ip": request.remote_addr,
+            "user_agent": request.headers.get('User-Agent', ''),
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "webhook_endpoint": request.endpoint
+        }
+        
+        # Add bot detection signals if available
+        if hasattr(request, 'bot_signals'):
+            enhanced_payload["bot_signals"] = request.bot_signals
+        
+        response = requests.post(
+            BSE_ENDPOINT,
+            json=enhanced_payload,
+            timeout=10,
+            headers={'Content-Type': 'application/json'}
+        )
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            logger.error(f"BSE returned status {response.status_code}: {response.text}")
+            return {"error": "BSE processing failed", "status_code": response.status_code}
+    
+    except requests.exceptions.Timeout:
+        logger.error("BSE request timeout")
+        return {"error": "BSE timeout"}
+    except Exception as e:
+        logger.error(f"BSE request error: {e}")
+        return {"error": str(e)}
+
 @app.route('/webhook', methods=['POST'])
 @limiter.limit("100 per hour")
 @require_webhook_auth
+@require_bot_detection  # NEW: Add bot detection
 def handle_webhook():
     request_start_time = datetime.utcnow()
     
@@ -308,6 +500,31 @@ def handle_webhook():
         if not isinstance(data, dict):
             log_skipped_payload(data, "Payload is not a JSON object", "INVALID_PAYLOAD")
             return jsonify(ERROR_RESPONSES["INVALID_PAYLOAD"]), 400
+
+        # NEW: Detect fake referrals before processing
+        if data.get("event_type") == "referral":
+            fake_referral_result = FakeReferralDetectionService.detect_fake_referral_patterns(data)
+            
+            if fake_referral_result.get("is_fake", False):
+                logger.warning(f"🚨 Fake referral detected from {request.remote_addr}: {fake_referral_result['signals']}")
+                
+                # Log fake referral detection
+                try:
+                    supabase.table("fake_referral_detections").insert({
+                        "user_id": data.get("user_id"),
+                        "ip_address": request.remote_addr,
+                        "fake_signals": fake_referral_result["signals"],
+                        "risk_score": fake_referral_result["risk_score"],
+                        "payload": data,
+                        "timestamp": datetime.utcnow().isoformat() + "Z"
+                    }).execute()
+                except Exception as log_error:
+                    logger.error(f"Failed to log fake referral detection: {log_error}")
+                
+                error_response = ERROR_RESPONSES["FAKE_REFERRAL_DETECTED"].copy()
+                error_response["fake_signals"] = fake_referral_result["signals"]
+                error_response["risk_score"] = fake_referral_result["risk_score"]
+                return jsonify(error_response), 403
 
         # Validate required fields with detailed error messages
         validation_errors = []
@@ -365,6 +582,33 @@ def handle_webhook():
             # Log but don't fail the request for duplicate check errors
             logger.warning(f"Error checking for duplicates: {dup_check_error}")
 
+        # NEW: Send to BSE for enhanced processing if enabled
+        bse_result = None
+        if BSE_ENABLED:
+            try:
+                if BSE_ASYNC_PROCESSING:
+                    # Asynchronous BSE processing
+                    logger.info(f"🧠 Sending payload to BSE for async processing: {user_id}")
+                    # In production, you might use Celery or similar for async processing
+                    # For now, we'll just log and continue
+                else:
+                    # Synchronous BSE processing
+                    logger.info(f"🧠 Sending payload to BSE for processing: {user_id}")
+                    bse_result = send_to_bse(data)
+                    
+                    if bse_result.get("error"):
+                        logger.warning(f"BSE processing error: {bse_result['error']}")
+                    else:
+                        # Use BSE results if available
+                        if "behavior_score" in bse_result:
+                            behavior_score = bse_result["behavior_score"]
+                        if "risk_flags" in bse_result:
+                            risk_flags.extend(bse_result["risk_flags"])
+            
+            except Exception as bse_error:
+                logger.error(f"BSE integration error: {bse_error}")
+                # Continue processing even if BSE fails
+
         # Prepare payload for database
         payload = {
             "id": user_id,
@@ -402,14 +646,27 @@ def handle_webhook():
         logger.info(f"✅ User {user_id} updated - Score: {behavior_score}, Flags: {len(risk_flags)}, "
                    f"Processing time: {processing_time:.3f}s")
         
-        return jsonify({
+        # Enhanced response with bot detection and BSE info
+        response_data = {
             "status": "success", 
             "user_id": user_id,
             "score": behavior_score,
             "flags_count": len(risk_flags),
             "processed_at": datetime.utcnow().isoformat() + "Z",
-            "processing_time_seconds": processing_time
-        }), 200
+            "processing_time_seconds": processing_time,
+            "bot_detection_enabled": BOT_DETECTION_WEBHOOK_ENABLED,
+            "bse_enabled": BSE_ENABLED
+        }
+        
+        # Add bot signals if available
+        if hasattr(request, 'bot_signals'):
+            response_data["bot_signals"] = request.bot_signals
+        
+        # Add BSE result if available
+        if bse_result:
+            response_data["bse_result"] = bse_result
+        
+        return jsonify(response_data), 200
 
     except Exception as e:
         logger.error(f"💥 Unexpected error handling webhook: {str(e)}")
@@ -420,20 +677,89 @@ def handle_webhook():
         )
         return jsonify(ERROR_RESPONSES["INTERNAL_ERROR"]), 500
 
+# NEW: Enhanced endpoints with bot detection info
+@app.route('/webhook/bot-detection', methods=['POST'])
+@limiter.limit(BOT_DETECTION_RATE_LIMIT)
+@require_webhook_auth
+def handle_bot_detection_webhook():
+    """Specialized endpoint for bot detection testing"""
+    try:
+        data = request.get_json(force=True) or {}
+        
+        # Extract bot detection signals
+        bot_signals = BotDetectionService.extract_bot_signals(data, dict(request.headers))
+        
+        # Check if request should be rejected
+        should_reject, reason = BotDetectionService.should_reject_bot(bot_signals)
+        
+        # Log bot detection attempt
+        try:
+            supabase.table("bot_detection_tests").insert({
+                "ip_address": request.remote_addr,
+                "user_agent": bot_signals.get("user_agent", ""),
+                "bot_probability": bot_signals.get("bot_probability", 0.0),
+                "bot_signals": bot_signals.get("bot_signals", []),
+                "should_reject": should_reject,
+                "rejection_reason": reason if should_reject else None,
+                "test_payload": data,
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }).execute()
+        except Exception as log_error:
+            logger.error(f"Failed to log bot detection test: {log_error}")
+        
+        return jsonify({
+            "status": "success",
+            "bot_detection": {
+                "bot_probability": bot_signals.get("bot_probability", 0.0),
+                "bot_signals": bot_signals.get("bot_signals", []),
+                "should_reject": should_reject,
+                "rejection_reason": reason if should_reject else None
+            },
+            "request_info": {
+                "ip_address": request.remote_addr,
+                "user_agent": bot_signals.get("user_agent", ""),
+                "fingerprint_id": data.get("fingerprint_id")
+            },
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }), 200 if not should_reject else 403
+    
+    except Exception as e:
+        logger.error(f"Bot detection test error: {e}")
+        return jsonify(ERROR_RESPONSES["INTERNAL_ERROR"]), 500
+
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Enhanced health check endpoint with database connectivity test"""
+    """Enhanced health check endpoint with bot detection status"""
     try:
         # Test database connectivity
         db_test = supabase.table("users").select("id").limit(1).execute()
         db_status = "healthy" if db_test else "error"
+        
+        # Test BSE connectivity if enabled
+        bse_status = "disabled"
+        if BSE_ENABLED:
+            try:
+                bse_health = requests.get(f"{BSE_ENDPOINT.replace('/process', '/health')}", timeout=5)
+                bse_status = "healthy" if bse_health.status_code == 200 else "error"
+            except:
+                bse_status = "error"
         
         health_data = {
             "status": "healthy",
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "database": db_status,
             "auth_method": WEBHOOK_AUTH_METHOD,
-            "version": "2.0.0"
+            "version": "2.1.0",
+            "features": {
+                "bot_detection": BOT_DETECTION_WEBHOOK_ENABLED,
+                "bse_integration": BSE_ENABLED,
+                "bse_status": bse_status,
+                "fake_referral_detection": True
+            },
+            "api_keys": {
+                "fingerprintjs": bool(FINGERPRINTJS_API_KEY),
+                "iphub": bool(IPHUB_API_KEY)
+            }
         }
         
         return jsonify(health_data), 200
@@ -448,7 +774,7 @@ def health_check():
 
 @app.route('/webhook/stats', methods=['GET'])
 def webhook_stats():
-    """Get webhook processing statistics with enhanced metrics"""
+    """Enhanced statistics with bot detection and fake referral metrics"""
     try:
         # Get recent activity stats
         recent_users = supabase.table("users").select("id, behavior_score, last_updated").order("last_updated", desc=True).limit(10).execute()
@@ -461,12 +787,41 @@ def webhook_stats():
             error_code = skip.get("error_code", "UNKNOWN")
             error_counts[error_code] = error_counts.get(error_code, 0) + 1
         
+        # NEW: Get bot detection statistics
+        bot_stats = {}
+        fake_referral_stats = {}
+        
+        try:
+            # Bot detection stats (last 24 hours)
+            yesterday = (datetime.utcnow() - timedelta(days=1)).isoformat()
+            bot_detections = supabase.table("bot_detections").select("id", count="exact").gte("timestamp", yesterday).execute()
+            bot_stats["detections_24h"] = bot_detections.count or 0
+            
+            # Fake referral stats (last 24 hours)
+            fake_referrals = supabase.table("fake_referral_detections").select("id", count="exact").gte("timestamp", yesterday).execute()
+            fake_referral_stats["detections_24h"] = fake_referrals.count or 0
+        
+        except Exception as stats_error:
+            logger.warning(f"Error getting enhanced stats: {stats_error}")
+        
         return jsonify({
             "recent_updates": len(recent_users.data) if recent_users.data else 0,
             "skipped_payloads_total": skipped_count_resp.count if hasattr(skipped_count_resp, 'count') else 0,
             "recent_users": recent_users.data[:5] if recent_users.data else [],
             "error_summary": error_counts,
             "auth_method": WEBHOOK_AUTH_METHOD,
+            "bot_detection": {
+                "enabled": BOT_DETECTION_WEBHOOK_ENABLED,
+                **bot_stats
+            },
+            "fake_referral_detection": {
+                "enabled": True,
+                **fake_referral_stats
+            },
+            "bse_integration": {
+                "enabled": BSE_ENABLED,
+                "async_processing": BSE_ASYNC_PROCESSING
+            },
             "generated_at": datetime.utcnow().isoformat() + "Z"
         }), 200
         
@@ -482,10 +837,11 @@ def test_webhook_auth():
         "status": "success",
         "message": "Authentication successful",
         "auth_method": WEBHOOK_AUTH_METHOD,
+        "bot_detection_enabled": BOT_DETECTION_WEBHOOK_ENABLED,
         "timestamp": datetime.utcnow().isoformat() + "Z"
     }), 200
 
-# Global error handlers
+# Keep all your existing error handlers...
 @app.errorhandler(429)
 def ratelimit_handler(e):
     logger.warning(f"Rate limit exceeded from {request.remote_addr}: {e}")
@@ -514,8 +870,10 @@ def method_not_allowed_handler(e):
     }), 405
 
 if __name__ == "__main__":
-    logger.info("🚀 Starting enhanced webhook server with authentication...")
+    logger.info("🚀 Starting enhanced webhook server with bot detection and fraud prevention...")
     logger.info(f"Authentication method: {WEBHOOK_AUTH_METHOD}")
-    logger.info(f"Security features: Signature verification, Rate limiting, Input validation")
+    logger.info(f"Bot detection: {'Enabled' if BOT_DETECTION_WEBHOOK_ENABLED else 'Disabled'}")
+    logger.info(f"BSE integration: {'Enabled' if BSE_ENABLED else 'Disabled'}")
+    logger.info(f"Security features: Signature verification, Rate limiting, Input validation, Bot detection, Fake referral detection")
     
     app.run(debug=True, host="0.0.0.0", port=5001)

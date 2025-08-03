@@ -388,3 +388,45 @@ CREATE TABLE user_api_costs (
 );
 
 CREATE INDEX idx_user_api_costs_user_month ON user_api_costs(user_id, created_at);
+
+
+-- Bot detection logs
+CREATE TABLE bot_detections (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    ip_address TEXT NOT NULL,
+    user_agent TEXT,
+    bot_probability DECIMAL(3,2) DEFAULT 0.0,
+    bot_signals TEXT[] DEFAULT '{}',
+    rejection_reason TEXT,
+    endpoint TEXT,
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Fake referral detection logs
+CREATE TABLE fake_referral_detections (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    user_id TEXT,
+    ip_address TEXT NOT NULL,
+    fake_signals TEXT[] DEFAULT '{}',
+    risk_score INTEGER DEFAULT 0,
+    payload JSONB,
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Bot detection tests (for the test endpoint)
+CREATE TABLE bot_detection_tests (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    ip_address TEXT NOT NULL,
+    user_agent TEXT,
+    bot_probability DECIMAL(3,2) DEFAULT 0.0,
+    bot_signals TEXT[] DEFAULT '{}',
+    should_reject BOOLEAN DEFAULT FALSE,
+    rejection_reason TEXT,
+    test_payload JSONB,
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Indexes for better performance
+CREATE INDEX idx_bot_detections_timestamp ON bot_detections(timestamp);
+CREATE INDEX idx_fake_referral_detections_timestamp ON fake_referral_detections(timestamp);
+CREATE INDEX idx_bot_detection_tests_timestamp ON bot_detection_tests(timestamp);
