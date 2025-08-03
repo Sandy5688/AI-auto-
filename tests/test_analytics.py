@@ -12,7 +12,7 @@ os.environ.update({
 })
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
-from analytics import safe_parse_timestamp, prepare_chart_data, format_chart_labels
+from analytics.analytics import safe_parse_timestamp, prepare_chart_data, format_chart_labels
 
 def test_safe_parse_timestamp_valid():
     """Test timestamp parsing with valid formats"""
