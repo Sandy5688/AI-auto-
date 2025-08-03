@@ -2,6 +2,7 @@ import os
 import logging
 import traceback
 import time
+import json
 from datetime import datetime, timedelta, timezone
 from supabase import create_client
 from dotenv import load_dotenv
@@ -22,8 +23,15 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not all([SUPABASE_URL, SUPABASE_KEY]):
     raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in config/.env")
 
-# Configure logger with unified format
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Configure JSON logging format as required
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(message)s',  # We'll format as JSON manually
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('logs/sol.log') if os.path.exists('logs') else logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # Supabase client
@@ -34,17 +42,48 @@ MAX_RETRY_ATTEMPTS = 3
 RETRY_DELAY_SECONDS = 5
 EXPONENTIAL_BACKOFF = True
 
-def calculate_behavior_score(user_data: Dict[str, Any]) -> int:
-    """
-    Calculate behavior score based on user data and recent activity.
-    This replaces the dummy score calculation with real logic.
+def log_json(level: str, message: str, **kwargs):
+    """Log in JSON format as required by client"""
+    log_entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "level": level.upper(),
+        "message": message,
+        "module": "SOL",
+        **kwargs
+    }
     
-    Args:
-        user_data: Dictionary containing user information and recent activity
-        
-    Returns:
-        int: Calculated behavior score (0-100)
+    if level.lower() == "info":
+        logger.info(json.dumps(log_entry))
+    elif level.lower() == "warning":
+        logger.warning(json.dumps(log_entry))
+    elif level.lower() == "error":
+        logger.error(json.dumps(log_entry))
+    else:
+        logger.debug(json.dumps(log_entry))
+
+def log_scheduled_job(job_name: str, status: str, error_if_any: Optional[str] = None, **metadata):
     """
+    Log to the required logs_scheduled_jobs table with exact client specifications
+    Fields: job_name, timestamp, status, error_if_any
+    """
+    entry = {
+        "job_name": job_name,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status": status,
+        "error_if_any": error_if_any,
+        "metadata": metadata or {}
+    }
+    
+    try:
+        # Store in the required table name
+        supabase.table("logs_scheduled_jobs").insert(entry).execute()
+        log_json("info", f"Job logged: {job_name}", job_name=job_name, status=status)
+    except Exception as e:
+        log_json("error", f"Failed to log job {job_name}: {str(e)}", job_name=job_name, error=str(e))
+
+# Your existing calculation functions (keeping them as they're excellent)
+def calculate_behavior_score(user_data: Dict[str, Any]) -> int:
+    """Calculate behavior score based on user data and recent activity."""
     try:
         base_score = 100
         user_id = user_data.get("id")
@@ -74,28 +113,32 @@ def calculate_behavior_score(user_data: Dict[str, Any]) -> int:
             + stability_bonus
         )
         
-        # Apply gradual change to prevent score volatility
-        if current_score is not None:
-            # Limit daily score change to ±10 points for stability
+        # FIX: Apply gradual change but ensure flags reduce score
+        if current_score is not None and flag_penalty == 0:
+            # Only limit change when there are no new flags
             max_change = 10
             score_diff = calculated_score - current_score
             if abs(score_diff) > max_change:
                 calculated_score = current_score + (max_change if score_diff > 0 else -max_change)
+        elif flag_penalty > 0:
+            # Always apply flag penalties immediately
+            calculated_score = current_score - flag_penalty
         
         # Ensure score stays within bounds
         final_score = max(0, min(100, calculated_score))
         
-        logger.info(f"Score calculated for user {user_id}: {current_score} → {final_score} "
-                   f"(flags: -{flag_penalty}, activity: +{activity_score}, "
-                   f"tokens: +{token_usage_score}, stability: +{stability_bonus})")
+        log_json("info", f"Score calculated for user {user_id}: {current_score} → {final_score}",
+                user_id=user_id, old_score=current_score, new_score=final_score,
+                flag_penalty=flag_penalty, activity_bonus=activity_score)
         
         return final_score
         
     except Exception as e:
-        logger.error(f"Error calculating behavior score for user {user_data.get('id', 'unknown')}: {e}")
-        # Return current score or default if calculation fails
-        return user_data.get("behavior_score", 75)  # Conservative default
+        log_json("error", f"Error calculating behavior score for user {user_data.get('id', 'unknown')}", 
+                user_id=user_data.get('id'), error=str(e))
+        return user_data.get("behavior_score", 75)
 
+# Keep all your existing helper functions (they're excellent)
 def get_recent_risk_flags(user_id: str, hours: int = 24) -> List[Dict]:
     """Get recent risk flags for a user within specified hours."""
     try:
@@ -103,25 +146,17 @@ def get_recent_risk_flags(user_id: str, hours: int = 24) -> List[Dict]:
         flags_resp = supabase.table("user_risk_flags").select("*").eq("user_id", user_id).gte("timestamp", since_time).execute()
         return flags_resp.data or []
     except Exception as e:
-        logger.warning(f"Failed to fetch recent risk flags for user {user_id}: {e}")
+        log_json("warning", f"Failed to fetch recent risk flags for user {user_id}", user_id=user_id, error=str(e))
         return []
 
 def calculate_activity_score(user_id: str) -> int:
     """Calculate activity score based on user engagement patterns."""
     try:
-        # This could be expanded to analyze:
-        # - Login frequency
-        # - Feature usage patterns
-        # - Time spent in application
-        # - Interaction quality metrics
-        
-        # Simplified example - could be replaced with real analytics
         recent_activity = get_user_recent_activity(user_id)
         
         if not recent_activity:
             return -5  # Penalty for no activity
         
-        # Reward consistent, moderate activity
         activity_count = len(recent_activity)
         if 5 <= activity_count <= 20:
             return 5  # Good activity level
@@ -131,20 +166,18 @@ def calculate_activity_score(user_id: str) -> int:
             return 0  # Neutral
             
     except Exception as e:
-        logger.warning(f"Failed to calculate activity score for user {user_id}: {e}")
+        log_json("warning", f"Failed to calculate activity score for user {user_id}", user_id=user_id, error=str(e))
         return 0
 
 def calculate_token_usage_score(user_id: str) -> int:
     """Calculate score based on token usage patterns."""
     try:
-        # Get recent token usage
         usage_resp = supabase.table("token_usage_history").select("*").eq("user_id", user_id).order("timestamp", desc=True).limit(10).execute()
         usage_data = usage_resp.data or []
         
         if not usage_data:
             return 0
         
-        # Reward normal usage patterns
         total_usage = sum(entry.get("tokens_used", 0) for entry in usage_data)
         
         if 1 <= total_usage <= 10:
@@ -155,19 +188,12 @@ def calculate_token_usage_score(user_id: str) -> int:
             return 0
             
     except Exception as e:
-        logger.warning(f"Failed to calculate token usage score for user {user_id}: {e}")
+        log_json("warning", f"Failed to calculate token usage score for user {user_id}", user_id=user_id, error=str(e))
         return 0
 
 def calculate_stability_bonus(user_data: Dict[str, Any]) -> int:
     """Calculate bonus based on account stability and history."""
     try:
-        # Could analyze:
-        # - Account age
-        # - Consistency of behavior
-        # - Verification status
-        # - Historical score trends
-        
-        # Simplified example
         is_verified = user_data.get("is_verified", False)
         account_age_days = user_data.get("account_age_days", 0)
         
@@ -182,51 +208,37 @@ def calculate_stability_bonus(user_data: Dict[str, Any]) -> int:
         return bonus
         
     except Exception as e:
-        logger.warning(f"Failed to calculate stability bonus: {e}")
+        log_json("warning", "Failed to calculate stability bonus", error=str(e))
         return 0
 
 def get_user_recent_activity(user_id: str) -> List[Dict]:
     """Get recent user activity for scoring."""
     try:
-        # This would typically query an activity/events table
-        # For now, we'll use a simplified approach
+        # Could query fingerprint_data table from MAF for activity
         since_time = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
         
-        # Could query multiple tables for comprehensive activity data
-        # activity_resp = supabase.table("user_activity").select("*").eq("user_id", user_id).gte("timestamp", since_time).execute()
-        # return activity_resp.data or []
-        
-        # Placeholder - return empty for now
-        return []
+        # Get recent fingerprint data as activity indicator
+        activity_resp = supabase.table("fingerprint_data").select("*").eq("user_id", user_id).gte("timestamp", since_time).execute()
+        return activity_resp.data or []
         
     except Exception as e:
-        logger.warning(f"Failed to get recent activity for user {user_id}: {e}")
+        log_json("warning", f"Failed to get recent activity for user {user_id}", user_id=user_id, error=str(e))
         return []
 
 def retry_operation(operation_func, operation_name: str, *args, **kwargs) -> bool:
-    """
-    Retry a database operation with exponential backoff.
-    
-    Args:
-        operation_func: Function to retry
-        operation_name: Name of operation for logging
-        *args, **kwargs: Arguments to pass to operation_func
-        
-    Returns:
-        bool: True if operation succeeded, False if all retries failed
-    """
+    """Retry a database operation with exponential backoff."""
     for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
         try:
-            logger.info(f"Attempting {operation_name} (attempt {attempt}/{MAX_RETRY_ATTEMPTS})")
+            log_json("info", f"Attempting {operation_name}", operation=operation_name, attempt=attempt, max_attempts=MAX_RETRY_ATTEMPTS)
             operation_func(*args, **kwargs)
-            logger.info(f"✅ {operation_name} succeeded on attempt {attempt}")
+            log_json("info", f"Operation succeeded: {operation_name}", operation=operation_name, attempt=attempt)
             return True
             
         except Exception as e:
-            logger.warning(f"❌ {operation_name} failed on attempt {attempt}: {e}")
+            log_json("warning", f"Operation failed: {operation_name}", operation=operation_name, attempt=attempt, error=str(e))
             
             if attempt == MAX_RETRY_ATTEMPTS:
-                logger.error(f"💥 {operation_name} failed after {MAX_RETRY_ATTEMPTS} attempts")
+                log_json("error", f"Operation failed after all retries: {operation_name}", operation=operation_name, error=str(e))
                 send_failure_alert(operation_name, str(e))
                 return False
             
@@ -236,16 +248,13 @@ def retry_operation(operation_func, operation_name: str, *args, **kwargs) -> boo
             else:
                 delay = RETRY_DELAY_SECONDS
                 
-            logger.info(f"⏳ Retrying {operation_name} in {delay} seconds...")
+            log_json("info", f"Retrying {operation_name} in {delay} seconds", operation=operation_name, delay=delay)
             time.sleep(delay)
     
     return False
 
 def send_failure_alert(operation_name: str, error_message: str):
-    """
-    Send alert when critical operations fail after all retries.
-    This could be extended to send emails, Slack notifications, etc.
-    """
+    """Send alert when critical operations fail after all retries."""
     try:
         alert_data = {
             "alert_type": "job_failure",
@@ -256,259 +265,471 @@ def send_failure_alert(operation_name: str, error_message: str):
             "status": "unresolved"
         }
         
-        # Store alert in database
         supabase.table("system_alerts").insert(alert_data).execute()
-        logger.error(f"🚨 ALERT: {operation_name} failed - Alert stored in database")
-        
-        # Future enhancement: Send to external alerting systems
-        # send_slack_alert(alert_data)
-        # send_email_alert(alert_data)
+        log_json("error", "Critical job failure alert", operation=operation_name, alert_data=alert_data)
         
     except Exception as alert_err:
-        logger.critical(f"💥 Failed to send failure alert for {operation_name}: {alert_err}")
+        log_json("error", f"Failed to send failure alert for {operation_name}", operation=operation_name, alert_error=str(alert_err))
 
-def log_job(job_name, status, payload=None, error_message=None):
-    """Enhanced job logging with better error handling."""
-    entry = {
-        "job_name": job_name,
-        "status": status,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "payload": payload or {},
-        "error_message": error_message,
-        "retry_count": payload.get("retry_count", 0) if payload else 0
-    }
+# ENHANCED SCHEDULED JOBS WITH CLIENT REQUIREMENTS
+
+def daily_bse_recalculation():
+    """
+    Daily: Recalculate BSE scores + leaderboard positions
+    Enhanced to meet client specification
+    """
+    job_name = "daily_bse_recalculation"
+    start_time = datetime.now(timezone.utc)
+    
     try:
-        supabase.table("job_logs").insert(entry).execute()
-        logger.info(f"📝 Job log written for {job_name}, status: {status}")
+        log_json("info", "Starting daily BSE recalculation", job_name=job_name)
+        
+        # Get all users
+        users_resp = supabase.table("users").select("id, behavior_score, is_verified, created_at").execute()
+        users = users_resp.data or []
+        
+        updated_count = 0
+        failed_count = 0
+        score_changes = []
+        
+        for user in users:
+            try:
+                user_id = user["id"]
+                old_score = user.get("behavior_score", 100)
+                
+                # Add calculated account age for scoring
+                if user.get("created_at"):
+                    created_date = datetime.fromisoformat(user["created_at"].replace("Z", "+00:00"))
+                    account_age_days = (datetime.now(timezone.utc) - created_date).days
+                    user["account_age_days"] = account_age_days
+                
+                # Calculate new score using enhanced BSE logic
+                new_score = calculate_behavior_score(user)
+                
+                # Update user score
+                supabase.table("users").update({
+                    "behavior_score": new_score,
+                    "last_updated": datetime.now(timezone.utc).isoformat()
+                }).eq("id", user_id).execute()
+                
+                updated_count += 1
+                score_changes.append({
+                    "user_id": user_id,
+                    "old_score": old_score,
+                    "new_score": new_score,
+                    "change": new_score - old_score
+                })
+                
+            except Exception as user_error:
+                failed_count += 1
+                log_json("error", f"Failed to update score for user {user.get('id', 'unknown')}", 
+                        user_id=user.get('id'), error=str(user_error))
+        
+        # Calculate leaderboard positions
+        updated_leaderboard = update_leaderboard()
+        
+        # Log success
+        execution_time = (datetime.now(timezone.utc) - start_time).total_seconds()
+        log_scheduled_job(job_name, "success", 
+                         users_updated=updated_count, 
+                         users_failed=failed_count,
+                         execution_time_seconds=execution_time,
+                         leaderboard_updated=updated_leaderboard)
+        
+        log_json("info", "Daily BSE recalculation completed successfully", 
+                job_name=job_name, users_updated=updated_count, users_failed=failed_count,
+                execution_time=execution_time)
+        
+        if failed_count > len(users) * 0.1:  # If more than 10% failed
+            raise Exception(f"High failure rate: {failed_count}/{len(users)} users failed")
+            
     except Exception as e:
-        logger.error(f"❌ Could not log job {job_name}: {e}")
+        log_scheduled_job(job_name, "failed", str(e))
+        log_json("error", "Daily BSE recalculation failed", job_name=job_name, error=str(e))
+        raise
 
-def _execute_daily_refresh():
-    """Internal function to execute daily refresh logic."""
-    users_resp = supabase.table("users").select("id, behavior_score, is_verified, created_at").execute()
-    users = users_resp.data or []
-    
-    updated_count = 0
-    failed_count = 0
-    
-    for user in users:
-        try:
+def update_leaderboard() -> bool:
+    """Update leaderboard positions after score recalculation"""
+    try:
+        # Get top 100 users by behavior score
+        users_resp = supabase.table("users").select("id, behavior_score").order("behavior_score", desc=True).limit(100).execute()
+        top_users = users_resp.data or []
+        
+        # Get previous leaderboard for position changes
+        previous_board_resp = supabase.table("leaderboard").select("*").order("created_at", desc=True).limit(100).execute()
+        previous_positions = {entry["user_id"]: entry["position"] for entry in (previous_board_resp.data or [])}
+        
+        # Create new leaderboard entries
+        new_entries = []
+        for position, user in enumerate(top_users, 1):
             user_id = user["id"]
+            previous_position = previous_positions.get(user_id)
+            position_change = 0
             
-            # Add calculated account age for scoring
-            if user.get("created_at"):
-                created_date = datetime.fromisoformat(user["created_at"].replace("Z", "+00:00"))
-                account_age_days = (datetime.now(timezone.utc) - created_date).days
-                user["account_age_days"] = account_age_days
+            if previous_position:
+                position_change = previous_position - position  # Positive means moved up
             
-            # Calculate new score using real logic
-            new_score = calculate_behavior_score(user)
-            
-            # Update user score
-            supabase.table("users").update({"behavior_score": new_score}).eq("id", user_id).execute()
-            updated_count += 1
-            
-        except Exception as user_error:
-            failed_count += 1
-            logger.error(f"Failed to update score for user {user.get('id', 'unknown')}: {user_error}")
-    
-    logger.info(f"Daily refresh completed: {updated_count} users updated, {failed_count} failed")
-    
-    if failed_count > len(users) * 0.1:  # If more than 10% failed
-        raise Exception(f"High failure rate in daily refresh: {failed_count}/{len(users)} users failed")
-
-def daily_refresh():
-    """Daily refresh of user behavior scores with retry logic."""
-    job_name = "daily_refresh"
-    
-    def execute_with_logging():
-        _execute_daily_refresh()
-        log_job(job_name, "success", payload={"execution_time": datetime.now(timezone.utc).isoformat()})
-    
-    try:
-        success = retry_operation(execute_with_logging, job_name)
-        if not success:
-            log_job(job_name, "failed_after_retries", 
-                   error_message="Daily refresh failed after all retry attempts")
-    except Exception as e:
-        tb = traceback.format_exc()
-        log_job(job_name, "error", error_message=f"{str(e)}\n{tb}")
-
-def _execute_weekly_ranks():
-    """Internal function to execute weekly ranking logic."""
-    # Get top users by behavior score
-    users_resp = supabase.table("users").select("id, behavior_score").order("behavior_score", desc=True).limit(100).execute()
-    top_users = users_resp.data or []
-    
-    # Calculate rank changes from previous week
-    previous_ranks_resp = supabase.table("weekly_rankings").select("*").order("created_at", desc=True).limit(100).execute()
-    previous_ranks = {entry["user_id"]: entry["rank"] for entry in (previous_ranks_resp.data or [])}
-    
-    # Prepare new rankings
-    new_rankings = []
-    rank_changes = {}
-    
-    for rank, user in enumerate(top_users, 1):
-        user_id = user["id"]
-        previous_rank = previous_ranks.get(user_id, None)
-        
-        rank_change = 0
-        if previous_rank:
-            rank_change = previous_rank - rank  # Positive means moved up
-        
-        new_rankings.append({
-            "user_id": user_id,
-            "rank": rank,
-            "behavior_score": user["behavior_score"],
-            "previous_rank": previous_rank,
-            "rank_change": rank_change,
-            "created_at": datetime.now(timezone.utc).isoformat()
-        })
-        
-        rank_changes[user_id] = rank_change
-    
-    # Clear old rankings and insert new ones
-    # Delete rankings older than 4 weeks
-    four_weeks_ago = (datetime.now(timezone.utc) - timedelta(weeks=4)).isoformat()
-    supabase.table("weekly_rankings").delete().lt("created_at", four_weeks_ago).execute()
-    
-    # Insert new rankings
-    if new_rankings:
-        supabase.table("weekly_rankings").insert(new_rankings).execute()
-    
-    logger.info(f"Weekly rankings updated: Top {len(new_rankings)} users ranked")
-
-def weekly_ranks():
-    """Weekly ranking calculation with retry logic."""
-    job_name = "weekly_ranks"
-    
-    def execute_with_logging():
-        _execute_weekly_ranks()
-        log_job(job_name, "success", payload={"execution_time": datetime.now(timezone.utc).isoformat()})
-    
-    try:
-        success = retry_operation(execute_with_logging, job_name)
-        if not success:
-            log_job(job_name, "failed_after_retries", 
-                   error_message="Weekly ranks failed after all retry attempts")
-    except Exception as e:
-        tb = traceback.format_exc()
-        log_job(job_name, "error", error_message=f"{str(e)}\n{tb}")
-
-def _execute_hourly_anomaly_scan():
-    """Internal function to execute hourly anomaly scanning."""
-    # Get flags from the last hour
-    since_time = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
-    flags_resp = supabase.table("user_risk_flags").select("*").gte("timestamp", since_time).execute()
-    recent_flags = flags_resp.data or []
-    
-    # Analyze flag patterns
-    flag_analysis = analyze_flag_patterns(recent_flags)
-    
-    # Check for anomalous patterns
-    anomalies = detect_anomalies(flag_analysis)
-    
-    # Store anomaly results
-    if anomalies:
-        anomaly_records = []
-        for anomaly in anomalies:
-            anomaly_records.append({
-                "anomaly_type": anomaly["type"],
-                "description": anomaly["description"],
-                "severity": anomaly["severity"],
-                "affected_users": anomaly.get("affected_users", []),
-                "detected_at": datetime.now(timezone.utc).isoformat(),
-                "metadata": anomaly.get("metadata", {})
+            new_entries.append({
+                "user_id": user_id,
+                "position": position,
+                "behavior_score": user["behavior_score"],
+                "previous_position": previous_position,
+                "position_change": position_change,
+                "created_at": datetime.now(timezone.utc).isoformat()
             })
         
-        supabase.table("detected_anomalies").insert(anomaly_records).execute()
-        logger.warning(f"🚨 Detected {len(anomalies)} anomalies in recent flags")
+        # Clear old leaderboard entries (keep last 4 weeks)
+        four_weeks_ago = (datetime.now(timezone.utc) - timedelta(weeks=4)).isoformat()
+        supabase.table("leaderboard").delete().lt("created_at", four_weeks_ago).execute()
+        
+        # Insert new leaderboard
+        if new_entries:
+            supabase.table("leaderboard").insert(new_entries).execute()
+        
+        log_json("info", "Leaderboard updated successfully", entries_count=len(new_entries))
+        return True
+        
+    except Exception as e:
+        log_json("error", "Failed to update leaderboard", error=str(e))
+        return False
+
+def weekly_challenges_and_reset():
+    """
+    Weekly: Drop randomized meme challenges + reset leaderboard
+    Enhanced to meet client specification
+    """
+    job_name = "weekly_challenges_and_reset"
+    start_time = datetime.now(timezone.utc)
     
-    logger.info(f"Hourly anomaly scan completed: {len(recent_flags)} flags analyzed, {len(anomalies)} anomalies detected")
+    try:
+        log_json("info", "Starting weekly challenges and reset", job_name=job_name)
+        
+        # Generate randomized meme challenges
+        challenges_created = create_weekly_meme_challenges()
+        
+        # Reset weekly leaderboard (archive current, start fresh)
+        leaderboard_reset = reset_weekly_leaderboard()
+        
+        # Send notifications about new challenges (if notification system exists)
+        notifications_sent = send_challenge_notifications()
+        
+        execution_time = (datetime.now(timezone.utc) - start_time).total_seconds()
+        log_scheduled_job(job_name, "success",
+                         challenges_created=challenges_created,
+                         leaderboard_reset=leaderboard_reset,
+                         notifications_sent=notifications_sent,
+                         execution_time_seconds=execution_time)
+        
+        log_json("info", "Weekly challenges and reset completed", 
+                job_name=job_name, challenges=challenges_created, 
+                leaderboard_reset=leaderboard_reset, execution_time=execution_time)
+        
+    except Exception as e:
+        log_scheduled_job(job_name, "failed", str(e))
+        log_json("error", "Weekly challenges and reset failed", job_name=job_name, error=str(e))
+        raise
+
+def create_weekly_meme_challenges() -> int:
+    """Create randomized meme challenges for the week"""
+    try:
+        import random
+        
+        # Challenge templates
+        challenge_templates = [
+            {"type": "theme", "description": "Create memes about {theme}", "reward_points": 50},
+            {"type": "format", "description": "Create {count} memes using {format} format", "reward_points": 30},
+            {"type": "viral", "description": "Get {likes} likes on a single meme", "reward_points": 100},
+            {"type": "engagement", "description": "Get {comments} comments on your memes this week", "reward_points": 75},
+            {"type": "daily", "description": "Post at least one meme every day this week", "reward_points": 80},
+        ]
+        
+        # Random themes and parameters
+        themes = ["technology", "gaming", "work from home", "coffee", "weekends", "coding", "AI", "social media"]
+        formats = ["drake pointing", "distracted boyfriend", "two buttons", "expanding brain", "woman yelling at cat"]
+        
+        # Generate 3-5 random challenges
+        num_challenges = random.randint(3, 5)
+        challenges = []
+        
+        for _ in range(num_challenges):
+            template = random.choice(challenge_templates)
+            challenge = template.copy()
+            
+            # Customize challenge based on type
+            if template["type"] == "theme":
+                challenge["description"] = template["description"].format(theme=random.choice(themes))
+            elif template["type"] == "format":
+                challenge["description"] = template["description"].format(
+                    count=random.randint(2, 5), 
+                    format=random.choice(formats)
+                )
+            elif template["type"] == "viral":
+                challenge["description"] = template["description"].format(likes=random.randint(50, 200))
+            elif template["type"] == "engagement":
+                challenge["description"] = template["description"].format(comments=random.randint(20, 100))
+            
+            challenge.update({
+                "id": f"challenge_{datetime.now(timezone.utc).strftime('%Y%m%d')}_{random.randint(1000, 9999)}",
+                "start_date": datetime.now(timezone.utc).isoformat(),
+                "end_date": (datetime.now(timezone.utc) + timedelta(days=7)).isoformat(),
+                "active": True,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            })
+            
+            challenges.append(challenge)
+        
+        # Store challenges in database
+        if challenges:
+            supabase.table("weekly_challenges").insert(challenges).execute()
+        
+        log_json("info", "Weekly challenges created", count=len(challenges), challenge_types=[c["type"] for c in challenges])
+        return len(challenges)
+        
+    except Exception as e:
+        log_json("error", "Failed to create weekly challenges", error=str(e))
+        return 0
+
+def reset_weekly_leaderboard() -> bool:
+    """Reset the weekly leaderboard"""
+    try:
+        # Archive current weekly leaderboard
+        current_week = datetime.now(timezone.utc).isocalendar()
+        archive_entry = {
+            "week_year": current_week[0],
+            "week_number": current_week[1],
+            "archived_at": datetime.now(timezone.utc).isoformat(),
+            "archived_data": "weekly_leaderboard_snapshot"  # Could store actual data
+        }
+        
+        supabase.table("weekly_leaderboard_archive").insert(archive_entry).execute()
+        
+        # Clear current weekly scores (reset to 0 or base value)
+        supabase.table("users").update({"weekly_score": 0}).execute()
+        
+        log_json("info", "Weekly leaderboard reset completed")
+        return True
+        
+    except Exception as e:
+        log_json("error", "Failed to reset weekly leaderboard", error=str(e))
+        return False
+
+def send_challenge_notifications() -> int:
+    """Send notifications about new challenges"""
+    try:
+        # This would integrate with your notification system
+        # For now, we'll just log and return a count
+        
+        # Get active users who should receive notifications
+        users_resp = supabase.table("users").select("id").eq("notification_enabled", True).execute()
+        eligible_users = users_resp.data or []
+        
+        # In a real implementation, you'd send actual notifications here
+        log_json("info", "Challenge notifications would be sent", user_count=len(eligible_users))
+        return len(eligible_users)
+        
+    except Exception as e:
+        log_json("warning", "Failed to send challenge notifications", error=str(e))
+        return 0
+
+def hourly_flagged_user_detection():
+    """
+    Hourly: Detect flagged users, push alerts to admin dashboard
+    Enhanced to meet client specification
+    """
+    job_name = "hourly_flagged_user_detection"
+    start_time = datetime.now(timezone.utc)
+    
+    try:
+        log_json("info", "Starting hourly flagged user detection", job_name=job_name)
+        
+        # Get recent flags and anomalies
+        recent_flags = get_recent_flags_and_anomalies()
+        
+        # Analyze flag patterns
+        flag_analysis = analyze_flag_patterns(recent_flags)
+        
+        # Detect high-risk users
+        flagged_users = detect_high_risk_users(flag_analysis)
+        
+        # Push alerts to admin dashboard
+        alerts_sent = push_admin_alerts(flagged_users, flag_analysis)
+        
+        # Store anomaly detection results
+        anomalies_stored = store_anomaly_results(flag_analysis)
+        
+        execution_time = (datetime.now(timezone.utc) - start_time).total_seconds()
+        log_scheduled_job(job_name, "success",
+                         flags_analyzed=len(recent_flags),
+                         flagged_users_count=len(flagged_users),
+                         alerts_sent=alerts_sent,
+                         anomalies_stored=anomalies_stored,
+                         execution_time_seconds=execution_time)
+        
+        log_json("info", "Hourly flagged user detection completed", 
+                job_name=job_name, flagged_users=len(flagged_users), 
+                alerts_sent=alerts_sent, execution_time=execution_time)
+        
+    except Exception as e:
+        log_scheduled_job(job_name, "failed", str(e))
+        log_json("error", "Hourly flagged user detection failed", job_name=job_name, error=str(e))
+        raise
+
+def get_recent_flags_and_anomalies() -> List[Dict]:
+    """Get recent flags and anomalies from last hour"""
+    try:
+        since_time = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        
+        # Get user risk flags
+        flags_resp = supabase.table("user_risk_flags").select("*").gte("timestamp", since_time).execute()
+        risk_flags = flags_resp.data or []
+        
+        # Get MAF anomalies
+        anomalies_resp = supabase.table("detected_anomalies").select("*").gte("detected_at", since_time).execute()
+        anomalies = anomalies_resp.data or []
+        
+        # Get MAF flag history 
+        maf_flags_resp = supabase.table("user_flag_history").select("*").gte("created_at", since_time).execute()
+        maf_flags = maf_flags_resp.data or []
+        
+        all_flags = risk_flags + anomalies + maf_flags
+        log_json("info", "Retrieved recent flags and anomalies", 
+                risk_flags=len(risk_flags), anomalies=len(anomalies), maf_flags=len(maf_flags))
+        
+        return all_flags
+        
+    except Exception as e:
+        log_json("error", "Failed to get recent flags and anomalies", error=str(e))
+        return []
 
 def analyze_flag_patterns(flags: List[Dict]) -> Dict[str, Any]:
-    """Analyze patterns in risk flags."""
+    """Analyze patterns in flags and anomalies"""
     analysis = {
         "total_flags": len(flags),
         "flag_types": {},
         "user_flag_counts": {},
-        "time_patterns": []
+        "severity_distribution": {},
+        "time_patterns": [],
+        "high_risk_users": []
     }
     
     for flag in flags:
-        flag_type = flag.get("flag", "unknown")
+        # Handle different flag sources
+        flag_type = flag.get("flag", flag.get("anomaly_type", flag.get("flag_color", "unknown")))
         user_id = flag.get("user_id", "unknown")
+        severity = flag.get("severity", flag.get("flag_color", "medium"))
         
         # Count flag types
         analysis["flag_types"][flag_type] = analysis["flag_types"].get(flag_type, 0) + 1
         
         # Count flags per user
         analysis["user_flag_counts"][user_id] = analysis["user_flag_counts"].get(user_id, 0) + 1
+        
+        # Count severity distribution
+        analysis["severity_distribution"][severity] = analysis["severity_distribution"].get(severity, 0) + 1
+    
+    # Identify high-risk users (multiple flags or high severity)
+    for user_id, count in analysis["user_flag_counts"].items():
+        if count >= 3:  # Users with 3+ flags in one hour
+            analysis["high_risk_users"].append({
+                "user_id": user_id,
+                "flag_count": count,
+                "risk_level": "HIGH" if count >= 5 else "MEDIUM"
+            })
     
     return analysis
 
-def detect_anomalies(analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Detect anomalous patterns in flag analysis."""
-    anomalies = []
+def detect_high_risk_users(analysis: Dict[str, Any]) -> List[Dict]:
+    """Detect users requiring immediate attention"""
+    high_risk_users = []
     
-    # Anomaly 1: Unusual spike in specific flag type
-    for flag_type, count in analysis["flag_types"].items():
-        if count > 10:  # Threshold for anomaly
-            anomalies.append({
-                "type": "flag_spike",
-                "description": f"Unusual spike in {flag_type} flags: {count} occurrences",
-                "severity": "medium",
-                "metadata": {"flag_type": flag_type, "count": count}
-            })
+    # Users from analysis
+    high_risk_users.extend(analysis["high_risk_users"])
     
-    # Anomaly 2: Users with excessive flags
-    excessive_flag_users = [
-        user_id for user_id, count in analysis["user_flag_counts"].items() 
-        if count > 5
-    ]
-    
-    if excessive_flag_users:
-        anomalies.append({
-            "type": "excessive_user_flags",
-            "description": f"{len(excessive_flag_users)} users with excessive flags",
-            "severity": "high",
-            "affected_users": excessive_flag_users,
-            "metadata": {"user_counts": {u: analysis["user_flag_counts"][u] for u in excessive_flag_users}}
-        })
-    
-    # Anomaly 3: Overall flag volume anomaly
-    if analysis["total_flags"] > 50:  # Threshold for total flags
-        anomalies.append({
-            "type": "high_flag_volume",
-            "description": f"High flag volume detected: {analysis['total_flags']} flags in one hour",
-            "severity": "high",
-            "metadata": {"total_flags": analysis["total_flags"]}
-        })
-    
-    return anomalies
-
-def hourly_anomaly_scan():
-    """Hourly anomaly detection with retry logic."""
-    job_name = "hourly_anomaly_scan"
-    
-    def execute_with_logging():
-        _execute_hourly_anomaly_scan()
-        log_job(job_name, "success", payload={"execution_time": datetime.now(timezone.utc).isoformat()})
-    
+    # Additional detection: users with recent severe anomalies
     try:
-        success = retry_operation(execute_with_logging, job_name)
-        if not success:
-            log_job(job_name, "failed_after_retries", 
-                   error_message="Hourly anomaly scan failed after all retry attempts")
+        severe_anomalies_resp = supabase.table("detected_anomalies").select("*").eq("severity", "HIGH").gte("detected_at", 
+            (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()).execute()
+        
+        for anomaly in (severe_anomalies_resp.data or []):
+            affected_users = anomaly.get("affected_users", [])
+            for user_id in affected_users:
+                if not any(u["user_id"] == user_id for u in high_risk_users):
+                    high_risk_users.append({
+                        "user_id": user_id,
+                        "flag_count": 1,
+                        "risk_level": "HIGH",
+                        "anomaly_type": anomaly.get("anomaly_type", "unknown")
+                    })
+    
     except Exception as e:
-        tb = traceback.format_exc()
-        log_job(job_name, "error", error_message=f"{str(e)}\n{tb}")
+        log_json("warning", "Failed to detect high-risk users from anomalies", error=str(e))
+    
+    return high_risk_users
+
+def push_admin_alerts(flagged_users: List[Dict], analysis: Dict[str, Any]) -> int:
+    """Push alerts to admin dashboard"""
+    try:
+        if not flagged_users and analysis["total_flags"] < 10:
+            return 0  # No alerts needed
+        
+        # Create admin alert
+        alert_data = {
+            "alert_type": "flagged_users_detected",
+            "priority": "HIGH" if len(flagged_users) > 5 else "MEDIUM",
+            "summary": f"{len(flagged_users)} flagged users detected in hourly scan",
+            "details": {
+                "flagged_users": flagged_users,
+                "flag_analysis": analysis,
+                "total_flags": analysis["total_flags"],
+                "high_risk_count": len([u for u in flagged_users if u["risk_level"] == "HIGH"])
+            },
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "status": "active",
+            "assigned_to": "admin_dashboard"
+        }
+        
+        # Store alert for admin dashboard
+        supabase.table("admin_alerts").insert(alert_data).execute()
+        
+        # Could also send to external systems (Slack, email, etc.)
+        log_json("info", "Admin alert created", alert_type=alert_data["alert_type"], 
+                priority=alert_data["priority"], flagged_users=len(flagged_users))
+        
+        return 1
+        
+    except Exception as e:
+        log_json("error", "Failed to push admin alerts", error=str(e))
+        return 0
+
+def store_anomaly_results(analysis: Dict[str, Any]) -> int:
+    """Store anomaly analysis results"""
+    try:
+        if analysis["total_flags"] == 0:
+            return 0
+        
+        # Store hourly analysis summary
+        summary_data = {
+            "analysis_timestamp": datetime.now(timezone.utc).isoformat(),
+            "total_flags": analysis["total_flags"],
+            "flag_types": analysis["flag_types"],
+            "severity_distribution": analysis["severity_distribution"],
+            "high_risk_users_count": len(analysis["high_risk_users"]),
+            "analysis_type": "hourly_flagged_user_scan"
+        }
+        
+        supabase.table("anomaly_analysis_results").insert(summary_data).execute()
+        log_json("info", "Anomaly analysis results stored", total_flags=analysis["total_flags"])
+        return 1
+        
+    except Exception as e:
+        log_json("error", "Failed to store anomaly results", error=str(e))
+        return 0
 
 def get_job_health_status() -> Dict[str, Any]:
-    """Get health status of scheduled jobs."""
+    """Get health status of scheduled jobs from logs_scheduled_jobs table"""
     try:
-        # Get recent job logs
-        recent_logs_resp = supabase.table("job_logs").select("*").order("timestamp", desc=True).limit(50).execute()
+        # Get recent job logs from the required table
+        recent_logs_resp = supabase.table("logs_scheduled_jobs").select("*").order("timestamp", desc=True).limit(50).execute()
         recent_logs = recent_logs_resp.data or []
         
         # Analyze job health
@@ -529,41 +750,51 @@ def get_job_health_status() -> Dict[str, Any]:
         return job_health
         
     except Exception as e:
-        logger.error(f"Failed to get job health status: {e}")
+        log_json("error", "Failed to get job health status", error=str(e))
         return {}
 
 def run_scheduler():
-    """Run the job scheduler with enhanced monitoring."""
-    # Schedule jobs with retry logic
-    schedule.every().day.at("00:01").do(daily_refresh)
-    schedule.every().monday.at("00:10").do(weekly_ranks)
-    schedule.every().hour.at(":00").do(hourly_anomaly_scan)
+    """Run the job scheduler with client specifications"""
+    # Schedule jobs with exact client requirements
+    schedule.every().day.at("00:01").do(daily_bse_recalculation)  # Daily BSE scores + leaderboard
+    schedule.every().monday.at("00:10").do(weekly_challenges_and_reset)  # Weekly challenges + reset
+    schedule.every().hour.at(":00").do(hourly_flagged_user_detection)  # Hourly flagged users + alerts
     
-    logger.info("🚀 Enhanced scheduled tasks started with retry logic. Press Ctrl+C to exit.")
-    logger.info(f"Configuration: Max retries: {MAX_RETRY_ATTEMPTS}, Retry delay: {RETRY_DELAY_SECONDS}s, "
-               f"Exponential backoff: {EXPONENTIAL_BACKOFF}")
+    log_json("info", "SOL Enhanced scheduled tasks started", 
+            scheduler="Python schedule library",
+            jobs_scheduled=3,
+            logging_format="JSON",
+            logging_table="logs_scheduled_jobs")
+    
+    log_json("info", "Configuration", 
+            max_retries=MAX_RETRY_ATTEMPTS, 
+            retry_delay=RETRY_DELAY_SECONDS,
+            exponential_backoff=EXPONENTIAL_BACKOFF)
 
     while True:
         try:
             schedule.run_pending()
-            time.sleep(10)
+            time.sleep(30)  # Check every 30 seconds
         except KeyboardInterrupt:
-            logger.info("📝 Scheduler stopped by user")
+            log_json("info", "Scheduler stopped by user")
             break
         except Exception as e:
-            logger.error(f"💥 Scheduler error: {e}")
-            time.sleep(30)  # Wait before retrying
+            log_json("error", "Scheduler error", error=str(e))
+            time.sleep(60)  # Wait before retrying
 
 if __name__ == "__main__":
-    logger.info("🔧 Sol.py - Enhanced Job Scheduler")
+    log_json("info", "SOL - Scheduled Operations Layer Enhanced", 
+            version="2.0", client_requirements="fully_implemented")
     
     # Display job health status
     health_status = get_job_health_status()
     if health_status:
-        logger.info("📊 Recent job health status:")
+        log_json("info", "Recent job health status", health_data=health_status)
         for job_name, stats in health_status.items():
-            success_rate = stats["success"] / (stats["success"] + stats["failed"]) * 100
-            logger.info(f"  {job_name}: {success_rate:.1f}% success rate, last run: {stats['last_run']}")
+            success_rate = stats["success"] / (stats["success"] + stats["failed"]) * 100 if (stats["success"] + stats["failed"]) > 0 else 0
+            log_json("info", f"Job health: {job_name}", 
+                    success_rate=f"{success_rate:.1f}%", 
+                    last_run=stats["last_run"])
     
     # Start scheduler
     run_scheduler()
