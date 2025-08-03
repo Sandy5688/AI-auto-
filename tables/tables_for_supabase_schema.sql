@@ -430,3 +430,48 @@ CREATE TABLE bot_detection_tests (
 CREATE INDEX idx_bot_detections_timestamp ON bot_detections(timestamp);
 CREATE INDEX idx_fake_referral_detections_timestamp ON fake_referral_detections(timestamp);
 CREATE INDEX idx_bot_detection_tests_timestamp ON bot_detection_tests(timestamp);
+
+
+-- Create generated_memes table
+CREATE TABLE generated_memes (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    image_url TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    tone TEXT NOT NULL CHECK (tone IN ('sarcastic', 'witty', 'crypto', 'relatable', 'dark humor')),
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Add tokens_remaining field to users table if it doesn't exist
+ALTER TABLE users ADD COLUMN IF NOT EXISTS tokens_remaining INTEGER DEFAULT 10;
+
+-- Create indexes for better performance
+CREATE INDEX idx_generated_memes_user_id ON generated_memes(user_id);
+CREATE INDEX idx_generated_memes_timestamp ON generated_memes(timestamp);
+CREATE INDEX idx_generated_memes_tone ON generated_memes(tone);
+
+-- Create index for daily generation queries
+CREATE INDEX idx_generated_memes_user_date ON generated_memes(user_id, timestamp);
+
+
+-- Create generated_memes table (NEW)
+CREATE TABLE IF NOT EXISTS generated_memes (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    image_url TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    tone TEXT NOT NULL CHECK (tone IN ('sarcastic', 'witty', 'crypto', 'relatable', 'dark humor')),
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Add tokens_remaining field to users table if it doesn't exist
+ALTER TABLE users ADD COLUMN IF NOT EXISTS tokens_remaining INTEGER DEFAULT 10;
+
+-- Create indexes for better performance
+CREATE INDEX IF NOT EXISTS idx_generated_memes_user_id ON generated_memes(user_id);
+CREATE INDEX IF NOT EXISTS idx_generated_memes_timestamp ON generated_memes(timestamp);
+CREATE INDEX IF NOT EXISTS idx_generated_memes_tone ON generated_memes(tone);
+CREATE INDEX IF NOT EXISTS idx_generated_memes_user_date ON generated_memes(user_id, timestamp);
+
+-- FIXED: Composite index for daily generation queries (without partial index predicate)
+CREATE INDEX IF NOT EXISTS idx_generated_memes_daily_lookup ON generated_memes(user_id, timestamp DESC);
