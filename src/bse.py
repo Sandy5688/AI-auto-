@@ -7,6 +7,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
 from supabase import create_client
+from config_manager import config_manager
+from audit_logger import audit_logger
+from environment_manager import env_manager
 
 # Load environment configuration
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -579,6 +582,14 @@ def calculate_enhanced_score(payload: Dict[str, Any]) -> tuple[int, List[str]]:
     user_id = payload.get("user_id")
     event_type = payload.get("event_type", "unknown")
     metadata = payload.get("metadata", {})
+        
+    # Get dynamic scoring rules
+    scoring_rules = config_manager.get_scoring_rules()
+    
+    base_score = scoring_rules["base_score"]
+    penalties = scoring_rules["penalties"]
+    bonuses = scoring_rules["bonuses"]
+    multipliers = scoring_rules["multipliers"]
     
     logger.info(f"🧮 Calculating enhanced score for user {user_id}, event: {event_type}")
     
@@ -708,6 +719,16 @@ def calculate_enhanced_score(payload: Dict[str, Any]) -> tuple[int, List[str]]:
         risk_level = get_risk_level(final_score)
         
         logger.info(f"📊 Score calculated for {user_id}: {final_score}/100 ({risk_level}) - Flags: {len(risk_flags)}")
+        # Log the scoring decision
+        audit_logger.log_user_scoring(
+            user_id=payload.get("user_id"),
+            old_score=get_current_user_score(payload.get("user_id")),
+            new_score=final_score,
+            flags=risk_flags,
+            reason="BSE_calculation",
+            source="enhanced_bse"
+        )
+        
         return final_score, risk_flags
         
     except Exception as e:

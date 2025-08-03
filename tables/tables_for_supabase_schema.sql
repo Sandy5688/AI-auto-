@@ -475,3 +475,49 @@ CREATE INDEX IF NOT EXISTS idx_generated_memes_user_date ON generated_memes(user
 
 -- FIXED: Composite index for daily generation queries (without partial index predicate)
 CREATE INDEX IF NOT EXISTS idx_generated_memes_daily_lookup ON generated_memes(user_id, timestamp DESC);
+
+
+#############################################
+-- System configurations table
+CREATE TABLE IF NOT EXISTS system_configs (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    config_type VARCHAR(50) NOT NULL,
+    config_data JSONB NOT NULL,
+    is_active BOOLEAN DEFAULT true,
+    created_by VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Comprehensive audit logs table
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    audit_id VARCHAR(50) UNIQUE NOT NULL,
+    action_type VARCHAR(50) NOT NULL,
+    risk_level VARCHAR(20) NOT NULL CHECK (risk_level IN ('HIGH_RISK', 'MEDIUM_RISK', 'LOW_RISK')),
+    user_id VARCHAR(255),
+    admin_user_id VARCHAR(255),
+    details JSONB NOT NULL,
+    timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+    source_system VARCHAR(50) NOT NULL
+);
+
+-- Bot detections table (if not exists)
+CREATE TABLE IF NOT EXISTS bot_detections (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    user_id VARCHAR(255),
+    ip_address INET,
+    user_agent TEXT,
+    bot_probability DECIMAL(3,2),
+    bot_signals JSONB,
+    detection_method VARCHAR(50),
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Create indexes for performance
+CREATE INDEX IF NOT EXISTS idx_system_configs_type_active ON system_configs(config_type, is_active);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_risk_level ON audit_logs(risk_level);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_action_type ON audit_logs(action_type);
+CREATE INDEX IF NOT EXISTS idx_bot_detections_timestamp ON bot_detections(timestamp);
+CREATE INDEX IF NOT EXISTS idx_bot_detections_ip ON bot_detections(ip_address);
