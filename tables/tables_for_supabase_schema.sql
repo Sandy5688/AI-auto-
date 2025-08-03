@@ -375,3 +375,16 @@ COMMENT ON TABLE migration_status IS 'Database migration tracking';
 -- End of Schema
 ################################################################
 
+CREATE TABLE user_api_costs (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    amount DECIMAL(10,4) NOT NULL,
+    service TEXT NOT NULL DEFAULT 'openai_dalle',
+    model TEXT,
+    size TEXT,
+    quality TEXT,
+    prompt_preview TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_user_api_costs_user_month ON user_api_costs(user_id, created_at);

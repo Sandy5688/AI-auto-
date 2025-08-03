@@ -1,6 +1,7 @@
 import os
 import logging
 import requests
+import openai
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from supabase import create_client
@@ -16,11 +17,30 @@ env_path = os.path.join(project_root, "config", ".env")
 
 load_dotenv(env_path)
 
-# Configuration constants
-REPLICATE_API = "https://api.replicate.com/v1/predictions"
+# OpenAI DALL·E Configuration
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+MONTHLY_BUDGET_LIMIT = float(os.getenv("MONTHLY_BUDGET_LIMIT", "20.0"))  # $20 max
+DALL_E_MODEL = os.getenv("DALL_E_MODEL", "dall-e-3")  # dall-e-3 or dall-e-2
+DALL_E_QUALITY = os.getenv("DALL_E_QUALITY", "standard")  # standard or hd
+DALL_E_SIZE = os.getenv("DALL_E_SIZE", "1024x1024")  # 1024x1024, 1792x1024, 1024x1792
+
+# Cost tracking (DALL·E 3 pricing)
+COST_PER_IMAGE = {
+    "dall-e-3": {
+        "1024x1024": {"standard": 0.040, "hd": 0.080},
+        "1792x1024": {"standard": 0.080, "hd": 0.120}, 
+        "1024x1792": {"standard": 0.080, "hd": 0.120}
+    },
+    "dall-e-2": {
+        "1024x1024": {"standard": 0.020, "hd": 0.020},
+        "512x512": {"standard": 0.018, "hd": 0.018},
+        "256x256": {"standard": 0.016, "hd": 0.016}
+    }
+}
+
+# Supabase Configuration  
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-MODEL_VERSION = os.getenv("REPLICATE_MODEL_VERSION")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 # Migration control flag
@@ -36,12 +56,16 @@ WEBHOOK_TIMEOUT = 30  # seconds
 if not all([SUPABASE_URL, SUPABASE_KEY]):
     raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in config/.env")
 
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY must be set in config/.env for meme generation")
+
 # Setup logger
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Initialize Supabase client
+# Initialize clients
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+openai.api_key = OPENAI_API_KEY
 
 # Enhanced cache configuration
 MEME_CACHE = {}
@@ -49,6 +73,74 @@ CACHE_MAX_SIZE = 1000  # Maximum number of cached items
 CACHE_DEFAULT_TTL_HOURS = 24  # Default time-to-live in hours
 CACHE_CLEANUP_INTERVAL_MINUTES = 30  # How often to run cleanup
 CACHE_CLEANUP_THREAD = None  # Global cleanup thread reference
+
+class CostTracker:
+    """Track and manage OpenAI API costs"""
+    
+    @staticmethod
+    def get_image_cost(model: str, size: str, quality: str) -> float:
+        """Get cost for generating an image"""
+        try:
+            return COST_PER_IMAGE.get(model, {}).get(size, {}).get(quality, 0.040)
+        except:
+            return 0.040  # Default DALL·E 3 standard cost
+    
+    @staticmethod
+    def get_user_monthly_spending(user_id: str) -> float:
+        """Get user's spending for current month"""
+        try:
+            # Get current month start
+            now = datetime.now(timezone.utc)
+            month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            
+            # Query spending from database
+            result = supabase.table("user_api_costs").select("amount").eq("user_id", user_id).gte("created_at", month_start.isoformat()).execute()
+            
+            total_spending = sum(record.get("amount", 0) for record in (result.data or []))
+            return total_spending
+            
+        except Exception as e:
+            logger.error(f"Error getting monthly spending for {user_id}: {e}")
+            return 0.0
+    
+    @staticmethod
+    def check_budget_limit(user_id: str, estimated_cost: float) -> tuple[bool, float, str]:
+        """
+        Check if user can afford the request
+        
+        Returns:
+            (can_afford: bool, current_spending: float, message: str)
+        """
+        current_spending = CostTracker.get_user_monthly_spending(user_id)
+        projected_spending = current_spending + estimated_cost
+        
+        if projected_spending > MONTHLY_BUDGET_LIMIT:
+            remaining_budget = MONTHLY_BUDGET_LIMIT - current_spending
+            message = f"Budget limit reached. Monthly limit: ${MONTHLY_BUDGET_LIMIT}, Current: ${current_spending:.3f}, Remaining: ${remaining_budget:.3f}"
+            return False, current_spending, message
+        
+        return True, current_spending, f"Budget OK. Current: ${current_spending:.3f}/{MONTHLY_BUDGET_LIMIT}"
+    
+    @staticmethod
+    def record_cost(user_id: str, amount: float, model: str, size: str, quality: str, prompt: str):
+        """Record API cost in database"""
+        try:
+            cost_record = {
+                "user_id": user_id,
+                "amount": amount,
+                "service": "openai_dalle",
+                "model": model,
+                "size": size,
+                "quality": quality,
+                "prompt_preview": prompt[:100] if prompt else "",
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }
+            
+            supabase.table("user_api_costs").insert(cost_record).execute()
+            logger.info(f"💰 Recorded ${amount:.3f} cost for user {user_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to record cost for {user_id}: {e}")
 
 class CacheEntry:
     """Enhanced cache entry with expiry and metadata"""
@@ -121,6 +213,8 @@ def migrate_plaintext_tokens():
     """
     Safely migrate legacy plaintext tokens with proper locking and error handling.
     Only runs if MIGRATE_ENABLED=true in .env and hasn't been completed before.
+    
+    Note: This is kept for backward compatibility but may not be needed for OpenAI-only mode
     """
     if not MIGRATE_ENABLED:
         logger.info("⏭️  Token migration disabled (MIGRATE_ENABLED=false)")
@@ -201,40 +295,16 @@ def migrate_plaintext_tokens():
 
 def get_user_token(user_id):
     """
-    Retrieve the decrypted API token for a given user from Supabase.
-    Enhanced to handle missing tokens safely without logging errors for new users.
-    
-    Returns:
-        str: Decrypted token if found and valid
-        None: If user not found, token is null/empty, or decryption fails
+    Note: For OpenAI mode, we don't need per-user tokens since we use a global OPENAI_API_KEY
+    This function is kept for compatibility but will return the global key or None
     """
-    try:
-        resp = supabase.table("users").select("encrypted_token").eq("id", user_id).single().execute()
-        
-        if not resp.data:
-            logger.info(f"User {user_id} not found in database")
-            return None
-            
-        encrypted_token = resp.data.get("encrypted_token")
-        
-        # Handle null/empty token gracefully (common for new users)
-        if not encrypted_token:
-            logger.info(f"No API token configured for user {user_id} (new user or token not set)")
-            return None
-        
-        # Attempt to decrypt the token
-        try:
-            decrypted_token = decrypt_token(encrypted_token)
-            logger.debug(f"Successfully retrieved token for user {user_id}")
-            return decrypted_token
-            
-        except Exception as decrypt_error:
-            logger.error(f"Failed to decrypt token for user {user_id}: {decrypt_error}")
-            return None
-            
-    except Exception as e:
-        logger.error(f"Database error retrieving token for user {user_id}: {e}")
-        return None
+    # For OpenAI DALL·E, we use the global API key
+    if OPENAI_API_KEY:
+        logger.debug(f"Using global OpenAI API key for user {user_id}")
+        return OPENAI_API_KEY
+    
+    logger.warning(f"No OpenAI API key available for user {user_id}")
+    return None
 
 def store_risk_flags(user_id, risk_flags, timestamp, supabase_client=supabase):
     """
@@ -485,64 +555,111 @@ def stop_cache_cleanup_scheduler():
         # Note: Can't cleanly stop daemon threads, they'll stop when main process stops
         logger.info("🛑 Cache cleanup scheduler will stop when main process stops")
 
-def generate_meme(prompt, tone, image_url=None, user_id=None):
+def generate_meme(prompt, tone, image_url=None, user_id=None, size=None, quality=None):
     """
-    Generate meme with enhanced caching, token tracking, and error handling.
+    Generate meme using OpenAI DALL·E with enhanced caching, cost tracking, and budget controls.
     """
+    if not user_id:
+        return {"error": "user_id_required", "message": "User ID is required for meme generation"}
+    
+    # Use defaults if not specified
+    size = size or DALL_E_SIZE
+    quality = quality or DALL_E_QUALITY
+    model = DALL_E_MODEL
+    
     # First, check cache for repeated requests
     cache_hit = get_cached_result(user_id, prompt, tone, image_url)
     if cache_hit:
         return cache_hit
 
-    # Retrieve decrypted token securely
-    api_token = get_user_token(user_id)
-    if not api_token:
-        logger.warning(f"Cannot generate meme for user {user_id}: No valid API token available")
-        return {"error": "API token not configured", "user_id": user_id}
-
-    headers = {
-        "Authorization": f"Token {api_token}",
-        "Content-Type": "application/json"
-    }
-
-    # Prepare payload for Replicate API
-    data = {
-        "version": MODEL_VERSION,
-        "input": {
-            "prompt": prompt,
-            "tone": tone
+    # Get estimated cost
+    estimated_cost = CostTracker.get_image_cost(model, size, quality)
+    
+    # Check budget
+    can_afford, current_spending, budget_message = CostTracker.check_budget_limit(user_id, estimated_cost)
+    
+    if not can_afford:
+        logger.warning(f"💸 Budget limit reached for user {user_id}: {budget_message}")
+        return {
+            "error": "monthly_budget_exceeded",
+            "message": budget_message,
+            "current_spending": current_spending,
+            "monthly_limit": MONTHLY_BUDGET_LIMIT,
+            "user_id": user_id
         }
-    }
-    if image_url:
-        data["input"]["image"] = image_url
 
+    # Create enhanced prompt with tone
+    enhanced_prompt = f"Create a {tone} meme about: {prompt}. Style: internet meme, clear readable text, engaging visual"
+    
     try:
-        response = requests.post(REPLICATE_API, headers=headers, json=data, timeout=30)
-        if response.status_code != 201:
-            logger.error(f"Replicate API error {response.status_code}: {response.text}")
-            return {"error": f"API error: {response.status_code}", "details": response.text, "user_id": user_id}
-
-        result = response.json()
-        logger.info(f"Meme generated successfully for user {user_id}")
-
-        # Cache the successful result
-        cache_result(user_id, prompt, tone, image_url, result)
-
-        # Track token usage for successful API call
-        try:
-            track_token_usage(supabase, user_id, tokens_used=1, action="meme_generation")
-            logger.info(f"Token usage tracked for user {user_id}")
-        except Exception as track_error:
-            logger.warning(f"Failed to track token usage for user {user_id}: {track_error}")
-
-        return result
-
-    except requests.exceptions.Timeout:
-        logger.error(f"Timeout generating meme for user {user_id}")
-        return {"error": "Request timeout", "user_id": user_id}
+        logger.info(f"🎨 Generating DALL·E image for user {user_id}: {model} {size} {quality} (${estimated_cost:.3f})")
+        
+        # Call OpenAI DALL·E API
+        response = openai.Image.create(
+            model=model,
+            prompt=enhanced_prompt,
+            size=size,
+            quality=quality,
+            n=1
+        )
+        
+        # Process response
+        if response.data:
+            image_url = response.data[0].url
+            result = {
+                "id": f"dalle_{int(time.time())}_{user_id}",
+                "status": "succeeded",
+                "output": [image_url],
+                "urls": {"get": image_url},
+                "model": model,
+                "size": size,
+                "quality": quality,
+                "cost": estimated_cost,
+                "prompt": prompt,
+                "tone": tone,
+                "generator": "openai_dalle",
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }
+            
+            # Record cost
+            CostTracker.record_cost(user_id, estimated_cost, model, size, quality, prompt)
+            
+            # Cache result
+            cache_result(user_id, prompt, tone, image_url, result)
+            
+            # Track token usage (for compatibility with existing tracking)
+            try:
+                track_token_usage(supabase, user_id, tokens_used=1, action="dalle_generation")
+                logger.info(f"Token usage tracked for user {user_id}")
+            except Exception as track_error:
+                logger.warning(f"Failed to track token usage for user {user_id}: {track_error}")
+            
+            logger.info(f"✅ DALL·E image generated successfully for user {user_id}")
+            return result
+        else:
+            logger.error(f"❌ OpenAI returned empty response for user {user_id}")
+            return {"error": "empty_response", "message": "OpenAI returned no images", "user_id": user_id}
+            
     except Exception as e:
-        logger.error(f"Exception during meme generation for user {user_id}: {e}")
-        return {"error": str(e), "user_id": user_id}
+        error_message = str(e).lower()
+        
+        # Identify error type by message content
+        if "rate limit" in error_message or "429" in error_message:
+            logger.error(f"🚫 OpenAI rate limit exceeded for user {user_id}: {e}")
+            return {"error": "rate_limit_exceeded", "message": "OpenAI API rate limit exceeded", "user_id": user_id}
+        elif "invalid" in error_message or "400" in error_message:
+            logger.error(f"❌ Invalid OpenAI request for user {user_id}: {e}")
+            return {"error": "invalid_request", "message": str(e), "user_id": user_id}
+        elif "auth" in error_message or "401" in error_message or "api key" in error_message:
+            logger.error(f"🔑 OpenAI authentication error: {e}")
+            return {"error": "authentication_error", "message": "OpenAI API authentication failed", "user_id": user_id}
+        else:
+            logger.error(f"💥 Unexpected OpenAI error for user {user_id}: {e}")
+            return {"error": "generation_failed", "message": str(e), "user_id": user_id}
+                
+    except Exception as e:
+        logger.error(f"💥 Unexpected error generating image for user {user_id}: {e}")
+        return {"error": "generation_failed", "message": str(e), "user_id": user_id}
 
 # Initialize cache cleanup on module import
 start_cache_cleanup_scheduler()
@@ -566,7 +683,9 @@ if __name__ != "__main__":  # Only run when imported, not when executed directly
     run_startup_migration()
 
 if __name__ == "__main__":
-    logger.info("🧪 Enhanced Meme Generator with Caching, Token Management & Retry Logic")
+    logger.info("🎨 OpenAI DALL·E Meme Generator with Cost Controls")
+    logger.info(f"💰 Monthly budget limit: ${MONTHLY_BUDGET_LIMIT}")
+    logger.info(f"🤖 Model: {DALL_E_MODEL}, Size: {DALL_E_SIZE}, Quality: {DALL_E_QUALITY}")
     
     # Display cache configuration
     logger.info(f"📦 Cache Configuration:")
@@ -585,12 +704,12 @@ if __name__ == "__main__":
     stats = get_cache_stats()
     logger.info(f"📊 Initial Cache Stats: {stats}")
     
-    # Example usage with caching
-    sample_prompt = "AI vs Humans"
+    # Test generation
+    sample_prompt = "AI taking over the world"
     sample_tone = "sarcastic"
-    sample_user = "test_user_123"
+    sample_user = "test_user_dalle"
     
-    logger.info(f"Testing meme generation with caching for user: {sample_user}")
+    logger.info(f"Testing DALL·E generation for user: {sample_user}")
     
     # First request (cache miss)
     meme1 = generate_meme(sample_prompt, sample_tone, user_id=sample_user)
@@ -603,6 +722,6 @@ if __name__ == "__main__":
     logger.info(f"📊 Final Cache Stats: {final_stats}")
     
     if meme1 and "error" not in meme1:
-        logger.info(f"✅ Meme generation successful")
+        logger.info(f"✅ DALL·E generation successful")
     else:
-        logger.error(f"❌ Meme generation failed: {meme1}")
+        logger.error(f"❌ DALL·E generation failed: {meme1}")
