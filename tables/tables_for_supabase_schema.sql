@@ -374,3 +374,4 @@ COMMENT ON TABLE migration_status IS 'Database migration tracking';
 
 -- End of Schema
 ################################################################
+
