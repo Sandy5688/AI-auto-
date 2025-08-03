@@ -1,3 +1,18 @@
+# At the top of tests/test_bse.py:
+"""
+LEGACY BSE TESTS - For Historical Reference Only
+================================================
+These tests are for the old calculate_score() function.
+
+Current Enhanced BSE tests are located in tests/bse/:
+- test_enhanced_bse.py (main functionality)
+- test_api_integration.py (API testing)
+- test_bse_performance.py (performance testing)  
+- test_manual_bse.py (manual testing)
+
+The Enhanced BSE system uses calculate_enhanced_score() and 
+main_processing_pipeline() with multi-source payload processing.
+"""
 import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))

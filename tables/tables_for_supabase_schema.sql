@@ -170,6 +170,38 @@ CREATE TABLE IF NOT EXISTS public.weekly_rankings (
 );
 
 ################################################################
+# SCHEMA MIGRATIONS & UPDATES
+################################################################
+
+-- Ensure all required columns exist (idempotent operations)
+DO $$
+BEGIN
+    -- Add last_updated column to users table if it doesn't exist
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns 
+        WHERE table_name = 'users' AND column_name = 'last_updated'
+    ) THEN
+        ALTER TABLE users ADD COLUMN last_updated TIMESTAMPTZ DEFAULT NOW();
+        RAISE NOTICE 'Added last_updated column to users table';
+    END IF;
+
+    -- Add metadata column to user_risk_flags table if it doesn't exist
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns 
+        WHERE table_name = 'user_risk_flags' AND column_name = 'metadata'
+    ) THEN
+        ALTER TABLE user_risk_flags ADD COLUMN metadata JSONB DEFAULT '{}'::jsonb;
+        RAISE NOTICE 'Added metadata column to user_risk_flags table';
+    END IF;
+
+    -- Update existing users to have last_updated if null
+    UPDATE users SET last_updated = NOW() WHERE last_updated IS NULL;
+    
+    RAISE NOTICE 'Schema migration checks completed';
+END
+$$;
+
+################################################################
 # PERFORMANCE INDEXES
 ################################################################
 
@@ -177,6 +209,7 @@ CREATE TABLE IF NOT EXISTS public.weekly_rankings (
 CREATE INDEX IF NOT EXISTS idx_users_behavior_score ON users(behavior_score);
 CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at);
 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+CREATE INDEX IF NOT EXISTS idx_users_last_updated ON users(last_updated);
 
 -- Token usage indexes
 CREATE INDEX IF NOT EXISTS idx_token_usage_user_id ON token_usage_history(user_id);
@@ -246,6 +279,7 @@ SELECT
     u.behavior_score,
     u.token_used,
     u.created_at,
+    u.last_updated,
     COUNT(urf.id) as total_risk_flags,
     COUNT(gm.id) as total_memes_generated,
     MAX(urf.timestamp) as last_flag_date,
@@ -253,7 +287,7 @@ SELECT
 FROM users u
 LEFT JOIN user_risk_flags urf ON u.id = urf.user_id
 LEFT JOIN generated_memes gm ON u.id = gm.user_id
-GROUP BY u.id, u.behavior_score, u.token_used, u.created_at;
+GROUP BY u.id, u.behavior_score, u.token_used, u.created_at, u.last_updated;
 
 -- System health monitoring view
 CREATE OR REPLACE VIEW system_health_summary AS
@@ -319,8 +353,10 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 
 INSERT INTO schema_version (version, description)
-VALUES ('1.0.0', 'Complete BSE schema with all enhancements')
-ON CONFLICT (version) DO NOTHING;
+VALUES ('1.1.0', 'Enhanced BSE schema with multi-source payload support and migration checks')
+ON CONFLICT (version) DO UPDATE SET 
+    applied_at = NOW(),
+    description = EXCLUDED.description;
 
 ################################################################
 # USEFUL COMMENTS FOR MAINTENANCE
