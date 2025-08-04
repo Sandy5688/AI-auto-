@@ -5,8 +5,9 @@ import openai
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from supabase import create_client
-from encryption_utils import encrypt_token, decrypt_token
-from token_tracking import track_token_usage
+from services.encryption_utils import encrypt_token, decrypt_token
+from services.token_tracking import track_token_usage
+
 import threading
 import time
 
