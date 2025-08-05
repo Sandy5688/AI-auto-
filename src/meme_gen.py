@@ -137,7 +137,7 @@ def generate_meme(prompt, tone, image_url=None, user_id=None):
 
         # Cache the successful result to avoid repeated calls for same input
         cache_result(user_id, prompt, tone, image_url, result)
-
+        track_token_usage(user_id)
         # Token usage tracking logic should go here (already implemented)
 
         return result
