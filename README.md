@@ -267,7 +267,7 @@ curl -X POST http://your-server:5001/webhook \
 - ✅ Integration: Verify data flows through to Supabase correctly.  
 - ✅ Edge Cases: Test missing or malformed payload data handling.  
 - ✅ Dashboard: Confirm analytics visualization loads expected data.
-
+- ✅ track_token_usage(user_id) is already implemented — remove the comment in Phase 2 cleanup.
 
 ---
 
