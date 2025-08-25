@@ -129,3 +129,4 @@ APScheduler==3.10.4             # Alternative to schedule for complex jobs
 
 # Database Enhancements  
 psycopg2-binary==2.9.7         # PostgreSQL adapter for direct DB access
+flask-socketio
